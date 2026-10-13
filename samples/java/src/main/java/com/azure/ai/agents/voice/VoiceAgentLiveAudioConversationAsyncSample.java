@@ -122,9 +122,9 @@ public class VoiceAgentLiveAudioConversationAsyncSample {
                     conversationId.set(id);
                 }
             } else if (event instanceof RealtimeInputAudioBufferSpeechStartedEvent) {
+                processor.skipPendingAudio();
+                System.out.println("(listening...)");
                 if (responseActive.get()) {
-                    processor.skipPendingAudio();
-                    System.out.println("(listening...)");
                     return session.cancelResponse().timeout(SEND_TIMEOUT);
                 }
             } else if (event instanceof RealtimeConversationItemInputAudioTranscriptionCompletedEvent) {
@@ -259,8 +259,8 @@ public class VoiceAgentLiveAudioConversationAsyncSample {
                     }
                     synchronized (playback) {
                         queuedPlaybackBytes -= pcm.length;
+                        speaker.write(pcm, 0, pcm.length);
                     }
-                    speaker.write(pcm, 0, pcm.length);
                 }
             } catch (InterruptedException error) {
                 Thread.currentThread().interrupt();
@@ -297,9 +297,11 @@ public class VoiceAgentLiveAudioConversationAsyncSample {
         }
 
         synchronized void skipPendingAudio() {
-            clearPlayback();
-            if (speaker != null) {
-                speaker.flush();
+            synchronized (playback) {
+                clearPlayback();
+                if (speaker != null) {
+                    speaker.flush();
+                }
             }
         }
 

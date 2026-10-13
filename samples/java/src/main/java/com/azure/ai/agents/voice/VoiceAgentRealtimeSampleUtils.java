@@ -5,16 +5,22 @@ package com.azure.ai.agents.voice;
 
 import com.azure.ai.agents.AgentsAsyncClient;
 import com.azure.ai.agents.BetaVoiceAgentsConversationsAsyncClient;
+import com.azure.ai.agents.models.VoiceConversation;
+import com.azure.ai.agents.models.VoiceConversationStatus;
 import com.azure.core.exception.ResourceNotFoundException;
 import com.azure.core.http.rest.RequestOptions;
 import com.azure.core.util.BinaryData;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 
 final class VoiceAgentRealtimeSampleUtils {
     static final int SAMPLE_RATE = 24000;
+    private static final Duration PERSISTENCE_POLL_INTERVAL = Duration.ofSeconds(1);
+    private static final Duration PERSISTENCE_TIMEOUT = Duration.ofMinutes(1);
 
     private VoiceAgentRealtimeSampleUtils() {
     }
@@ -28,12 +34,31 @@ final class VoiceAgentRealtimeSampleUtils {
 
     static Mono<Void> readConversation(BetaVoiceAgentsConversationsAsyncClient conversations, String agentName,
         String conversationId) {
-        return conversations.getAgentConversation(agentName, conversationId)
+        return waitForConversationPersistence(conversations, agentName, conversationId)
             .doOnNext(conversation -> System.out.printf("Conversation %s: status=%s, created=%s%n",
                 conversation.getId(), conversation.getStatus(), conversation.getCreatedAt()))
             .thenMany(conversations.listAgentConversationItems(agentName, conversationId, new RequestOptions()))
             .doOnNext(VoiceAgentRealtimeSampleUtils::printConversationItem)
             .then();
+    }
+
+    private static Mono<VoiceConversation> waitForConversationPersistence(
+        BetaVoiceAgentsConversationsAsyncClient conversations, String agentName, String conversationId) {
+        return Mono.defer(() -> conversations.getAgentConversation(agentName, conversationId))
+            .onErrorResume(ResourceNotFoundException.class, ignored -> Mono.empty())
+            .flatMap(conversation -> {
+                if (VoiceConversationStatus.COMPLETED.equals(conversation.getStatus())) {
+                    return Mono.just(conversation);
+                }
+                if (VoiceConversationStatus.FAILED.equals(conversation.getStatus())) {
+                    return Mono.error(new IllegalStateException(
+                        "Persistence failed for conversation " + conversationId + "."));
+                }
+                return Mono.empty();
+            })
+            .repeatWhenEmpty(repeat -> repeat.delayElements(PERSISTENCE_POLL_INTERVAL))
+            .timeout(PERSISTENCE_TIMEOUT, Mono.error(new TimeoutException(
+                "Conversation " + conversationId + " was not persisted within one minute.")));
     }
 
     @SuppressWarnings("unchecked")
