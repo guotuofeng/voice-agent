@@ -8,5 +8,7 @@ agent-reply-*.wav
 voice-agent-output/
 samples/CSharp/.packages/
 samples/CSharp/*.pcm
+samples/CSharp/obj/
+samples/java/target/
 
 samples/audio_transcribe_and_translate/.env
