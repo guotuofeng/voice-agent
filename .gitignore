@@ -12,6 +12,8 @@ voice-agent-output/
 samples/CSharp/.packages/
 samples/CSharp/*.pcm
 samples/CSharp/obj/
+samples/CSharp/bin/
+samples/CSharp/.vs/
 samples/java/target/
 
 samples/audio_transcribe_and_translate/.env

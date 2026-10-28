@@ -11,7 +11,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r requirements.txt \
+RUN python -m pip install --no-cache-dir --upgrade --index-url "$PIP_INDEX_URL" "pip>=26.2.0" \
+    && python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r requirements.txt \
     && adduser -D -u 10001 appuser
 
 COPY auth.py check_websocket.py live.py server.py personalized-agent.json weather-toolbox.json ./
