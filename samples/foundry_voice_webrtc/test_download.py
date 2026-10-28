@@ -86,12 +86,22 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         async with TestClient(TestServer(app)) as client:
             origin = {"Origin": str(client.make_url("")).rstrip("/")}
             with patch("server.write_conversation_archive", writing):
+                client.session.cookie_jar.update_cookies(
+                    {"voice_agent_protocol": "live"}, response_url=client.make_url("/"))
                 response = await client.post("/api/conversation/download", headers=origin, json={"downloadToken": token})
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers["Cache-Control"], "no-store")
                 self.assertEqual(response.content_type, "application/zip")
                 with zipfile.ZipFile(io.BytesIO(await response.read())) as archive:
                     self.assertIn("audio.wav", archive.namelist())
+                response = await client.post("/api/conversation/download?agent_selection=live",
+                                             headers=origin, json={"downloadToken": token})
+                self.assertEqual(response.status, 403)
+                live_token = conversation_download_token(app[DOWNLOAD_SECRET], "agent-live", "conv_live")
+                response = await client.post("/api/conversation/download?agent_selection=live",
+                                             headers=origin, json={"downloadToken": live_token})
+                self.assertEqual(response.status, 200)
+                await response.read()
             with patch("server.write_conversation_archive", AsyncMock(side_effect=ConversationDownloadError("Not ready", 409))):
                 response = await client.post("/api/conversation/download", headers=origin, json={"downloadToken": token})
                 self.assertEqual(response.status, 409)

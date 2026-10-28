@@ -23,6 +23,7 @@ async function setup(transport, overrides = {}) {
   });
   const element = id => {
     assert.notEqual(id, 'prepare-agent', 'The removed setup button must not be referenced');
+    assert.notEqual(id, 'live-voice', 'The removed Live voice selector must not be referenced');
     if (!elements.has(id)) elements.set(id, makeElement());
     return elements.get(id);
   };
@@ -38,6 +39,7 @@ async function setup(transport, overrides = {}) {
     }, body:makeElement() },
     window: { addEventListener() {} }, WebSocket: { OPEN: 1 },
     crypto: webcrypto,
+    sessionStorage: {getItem: () => null, setItem() {}},
     fetch: async () => ({ ok: true, json: async () => ({
       configured: true, agent:'demo-agent', exists:true, transcriptionModel:'mai-transcribe-2',
     }) }),
@@ -54,6 +56,7 @@ async function setup(transport, overrides = {}) {
     call = session;
     session.history = createHistory(session);
     return {markReady, handleEvent, updateTextInput, stop, connectWebRtc, start, openSocket, prepareAgent,
+      applyAgentDetails, inspectAgent,
       reconnect: () => { call = session; session.history = createHistory(session); }};
   })()`, context).then(api => context.api = api);
   return { ...context.api, element, session, sent, created };
@@ -281,7 +284,7 @@ for (const model of ['azure-realtime-flash-2026-10-14', 'gpt-realtime-2.1-mini']
     ui.element('agent-model-choice').onchange();
     assert.equal(ui.element('voice').hidden, false);
     assert.equal(ui.element('native-voice').hidden, true);
-    assert.equal(ui.element('live-voice').hidden, true);
+    assert.equal(ui.element('live-voice-info').hidden, true);
     assert.equal(ui.element('agent-transcription-choice').disabled, false);
     assert.equal(ui.element('save-model').disabled, false);
     await ui.element('save-model').onclick();
@@ -293,27 +296,32 @@ for (const model of ['azure-realtime-flash-2026-10-14', 'gpt-realtime-2.1-mini']
   });
 }
 
-test('GPT Live selection previews only its voices and omits independent transcription when saving', async () => {
+test('GPT Live selection uses the companion endpoint and returning to realtime preserves its saved model', async () => {
   const requests = [];
   const ui = await setup('websocket', {
     fetch: async (url, options) => {
-      if (options?.body) requests.push(JSON.parse(options.body));
+      if (options?.body) requests.push([url, JSON.parse(options.body)]);
       return {ok:true, json:async()=>url === '/api/config' ? {configured:true, defaultTranscriptionModel:'mai-transcribe-2'} :
-        options?.method === 'POST' ?
-          {model:'gpt-live-1-test', modelChoice:'gpt-live-1', version:'2', transcriptionModel:null} :
-          {exists:true, model:'gpt-5.4', version:'1', transcriptionModel:'mai-transcribe-2'}};
+        options?.method === 'POST' && JSON.parse(options.body).model === 'gpt-live-1' ?
+          {agent:'demo-agent-live', agentSelection:'live', model:'gpt-live-1-test', modelChoice:'gpt-live-1', version:'1', transcriptionModel:null} :
+          {exists:true, agentSelection:'base', model:'gpt-5.4', version:'1', transcriptionModel:'mai-transcribe-2'}};
     },
   });
   ui.stop();
   ui.element('agent-model-choice').value = 'gpt-live-1';
   ui.element('agent-model-choice').onchange();
-  assert.equal(ui.element('live-voice').hidden, false);
+  assert.equal(ui.element('live-voice-info').hidden, false);
+  assert.equal(ui.element('voice-label').hidden, true);
   assert.equal(ui.element('native-voice').hidden, true);
   assert.equal(ui.element('voice').hidden, true);
   assert.equal(ui.element('agent-transcription-choice').disabled, true);
   assert.equal(ui.element('save-model').disabled, false);
+  assert.equal(ui.element('save-model').textContent, 'Create or use GPT Live Agent');
+  assert.equal(ui.element('start').disabled, true);
+  assert.equal(ui.element('transport').disabled, true);
   await ui.element('save-model').onclick();
-  assert.deepEqual(requests, [{model:'gpt-live-1', version:'1'}]);
+  assert.deepEqual(requests, [['/api/agent/switch', {model:'gpt-live-1', version:'1'}]]);
+  assert.equal(ui.element('agent').textContent, 'demo-agent-live');
   assert.equal(ui.element('agent-model').textContent, 'gpt-live-1-test');
   assert.equal(ui.element('agent-model-choice').value, 'gpt-live-1');
   assert.equal(ui.element('agent-transcription').textContent, 'Built into GPT Live');
@@ -321,9 +329,83 @@ test('GPT Live selection previews only its voices and omits independent transcri
   assert.equal(ui.element('transport').disabled, true);
   ui.element('agent-model-choice').value = 'gpt-5.4';
   ui.element('agent-model-choice').onchange();
-  assert.equal(ui.element('live-voice').hidden, true);
+  assert.equal(ui.element('live-voice-info').hidden, true);
+  assert.equal(ui.element('voice-label').hidden, false);
   assert.equal(ui.element('voice').hidden, false);
+  assert.equal(ui.element('agent-transcription-choice').disabled, true);
+  assert.equal(ui.element('save-model').textContent, 'Use realtime Agent');
+  await ui.element('save-model').onclick();
+  assert.deepEqual(requests[1], ['/api/agent/switch?agent_selection=live', {model:'gpt-5.4', version:'1'}]);
+  assert.equal(ui.element('agent-model').textContent, 'gpt-5.4');
+  assert.equal(ui.element('save-model').textContent, 'Save new version');
   assert.equal(ui.element('agent-transcription-choice').disabled, false);
+});
+
+test('Tabs retain independent selections across reloads and route API requests and sockets explicitly', async () => {
+  const firstStorage = new Map(), secondStorage = new Map();
+  const storage = values => ({getItem:key=>values.get(key), setItem:(key,value)=>values.set(key,value)});
+  const requests = [], sockets = [];
+  const options = values => ({
+    sessionStorage:storage(values), location:{protocol:'http:', host:'localhost:8080'},
+    WebSocket:class {static OPEN=1; constructor(url){this.readyState=1; sockets.push(url);} close(){}},
+    fetch:async (url, request) => {
+      requests.push(url);
+      const live = url.includes('agent_selection=live') || request?.body?.includes('gpt-live-1');
+      return {ok:true, json:async()=>({configured:true, exists:true, version:'1', yaml:'kind: voice',
+        agent:live ? 'demo-agent-live' : 'demo-agent', agentSelection:live ? 'live' : 'base',
+        model:live ? 'gpt-live-1' : 'gpt-5.4', transcriptionModel:'mai-transcribe-2'})};
+    },
+  });
+  const first = await setup('websocket', options(firstStorage));
+  const second = await setup('websocket', options(secondStorage));
+  first.stop(); second.stop();
+  first.element('agent-model-choice').value = 'gpt-live-1';
+  await first.element('save-model').onclick();
+  assert.equal(firstStorage.get('voice-agent-selection'), 'live');
+  assert.equal(secondStorage.get('voice-agent-selection'), 'base');
+  await second.prepareAgent();
+  assert.equal(requests.at(-1), '/api/agent/prepare');
+  assert.equal(second.element('agent').textContent, 'demo-agent');
+  const reloaded = await setup('websocket', options(firstStorage));
+  assert.deepEqual(requests.slice(-2), ['/api/config?agent_selection=live', '/api/agent?agent_selection=live']);
+  reloaded.stop();
+  await reloaded.prepareAgent();
+  assert.equal(requests.at(-1), '/api/agent/prepare?agent_selection=live');
+  await reloaded.element('show-settings').onclick();
+  assert.equal(requests.at(-1), '/api/agent/settings?agent_selection=live');
+  reloaded.session.agentSelection = 'live';
+  reloaded.session.live = true;
+  reloaded.openSocket(reloaded.session);
+  assert.match(sockets.at(-1), /agent_selection=live/);
+  assert.match(sockets.at(-1), /protocol=live/);
+  reloaded.stop();
+  await second.inspectAgent();
+  assert.equal(requests.at(-1), '/api/agent');
+});
+
+test('Failed switches preserve tab selection; missing companion fallback changes only that tab', async () => {
+  const saved = new Map([['voice-agent-selection', 'live']]);
+  const requests = [];
+  let fallback = false;
+  const ui = await setup('websocket', {
+    sessionStorage:{getItem:key=>saved.get(key), setItem:(key,value)=>saved.set(key,value)},
+    fetch:async (url, options) => {
+      requests.push(url);
+      return {ok:!options?.method, json:async()=>options?.method ? {error:'Switch failed'} :
+        {configured:true, exists:true, version:'1', agentSelection:fallback ? 'base' : 'live',
+          model:fallback ? 'gpt-5.4' : 'gpt-live-1'}};
+    },
+  });
+  ui.stop();
+  ui.element('agent-model-choice').value = 'gpt-5.4';
+  await ui.element('save-model').onclick();
+  assert.equal(saved.get('voice-agent-selection'), 'live');
+  assert.match(ui.element('error').textContent, /Switch failed/);
+  fallback = true;
+  await ui.inspectAgent();
+  assert.equal(saved.get('voice-agent-selection'), 'base');
+  await ui.element('show-settings').onclick();
+  assert.equal(requests.at(-1), '/api/agent/settings');
 });
 
 for (const transport of ['websocket', 'webrtc']) {
@@ -344,17 +426,66 @@ for (const transport of ['websocket', 'webrtc']) {
     assert.equal(captions[1].children[0].textContent, 'Agent - live caption (not retained history)');
     assert.equal(captions[1].children[1].textContent, 'Hello');
     ui.updateTextInput();
-    assert.equal(ui.element('text-input').disabled, true);
+    assert.equal(ui.element('text-input').disabled, false);
     assert.equal(ui.element('send-text').disabled, true);
-    ui.element('text-input').value = 'Do not send realtime text';
-    ui.element('text-form').onsubmit({preventDefault() {}});
-    assert.equal(ui.sent.length, 0);
     await ui.element('stop').onclick();
     assert.equal(ui.sent[0].type, 'session.close');
     assert.equal(ui.element('stop').disabled, true);
     await ui.handleEvent(ui.session, {type:'session.closed', usage:{seconds:4}});
     assert.equal(ui.element('status').textContent, 'Conversation ended');
     assert.match(ui.element('hint').textContent, /4 seconds/);
+  });
+}
+
+test('GPT Live sends native user text and renders delegated replies without realtime history', async () => {
+  const ui = await setup('websocket');
+  ui.session.live = true;
+  ui.session.configured = true;
+  ui.session.userSpeaking = true;
+  ui.session.history = {handle() { throw new Error('Live text must bypass realtime history'); }, dispose() {}};
+  ui.markReady(ui.session);
+  ui.element('text-input').value = 'Find the latest Azure news';
+  ui.updateTextInput();
+  assert.equal(ui.element('send-text').disabled, false);
+  ui.element('text-form').onsubmit({preventDefault() {}});
+  assert.deepEqual(ui.sent, [
+    {type:'response.item.create', item:{type:'message', role:'user',
+      content:[{type:'input_text', text:'Find the latest Azure news'}]}},
+    {type:'response.create'},
+  ]);
+  assert.equal(ui.element('transcript').children[0].children[1].textContent, 'Find the latest Azure news');
+  assert.equal(ui.session.responding, true);
+  ui.element('text-input').value = 'Next question';
+  ui.element('text-form').onsubmit({preventDefault() {}});
+  assert.equal(ui.sent.length, 2);
+  for (const event of [
+    {type:'response.created', response:{id:'r1'}},
+    {type:'response.output_text.delta', item_id:'m1', content_index:0, delta:'Azure '},
+    {type:'response.output_text.delta', item_id:'m1', content_index:0, delta:'news'},
+    {type:'response.output_text.done', item_id:'m1', content_index:0, text:'Azure news.'},
+    {type:'response.completed', response:{id:'r1'}},
+  ]) await ui.handleEvent(ui.session, {type:'response.event', event});
+  const reply = ui.element('transcript').children[1];
+  assert.equal(reply.children[0].textContent, 'Agent - Responses backend');
+  assert.equal(reply.children[1].textContent, 'Azure news.');
+  assert.equal(ui.session.responding, false);
+  assert.equal(ui.element('send-text').disabled, false);
+});
+
+for (const failure of ['error', 'response.failed', 'response.incomplete']) {
+  test(`GPT Live ${failure} unlocks text input and marks partial replies incomplete`, async () => {
+    const ui = await setup('websocket');
+    ui.session.live = true;
+    ui.session.configured = true;
+    ui.markReady(ui.session);
+    await ui.handleEvent(ui.session, {type:'response.event', event:{type:'response.created'}});
+    await ui.handleEvent(ui.session, {type:'response.event', event:{type:'response.output_text.delta', delta:'Partial'}});
+    ui.element('text-input').value = 'Try again';
+    await ui.handleEvent(ui.session, {type:'response.event', event:{type:failure}});
+    assert.equal(ui.session.responding, false);
+    assert.equal(ui.element('send-text').disabled, false);
+    assert.equal(ui.element('error').hidden, false);
+    assert.equal(ui.element('transcript').children[0].children[0].textContent, 'Agent - Responses backend (incomplete)');
   });
 }
 
@@ -521,6 +652,59 @@ test('Conversation download waits for End and posts only its session capability'
   assert.equal(link.download, 'conversation-conv_test.zip');
   assert.equal(link.clicked, true);
   assert.match(ui.element('download-status').textContent, /conversation.json and audio.wav/);
+});
+
+test('Conversation downloads use the captured call selection instead of the current selection', async () => {
+  const requests = [];
+  const ui = await setup('websocket', {
+    URL:{createObjectURL:()=>'blob:recording', revokeObjectURL(){}},
+    fetch:async (url, options)=>{
+      if (options?.method === 'POST') {
+        requests.push(url);
+        return {ok:true, headers:{get:()=>'application/zip'}, blob:async()=>new Blob(['archive'])};
+      }
+      return {ok:true, json:async()=>({configured:true, exists:true})};
+    },
+  });
+  ui.session.agentSelection = 'live';
+  await ui.handleEvent(ui.session, {type:'bridge.conversation', conversationId:'conv_live', downloadToken:'signed-token'});
+  ui.stop();
+  ui.applyAgentDetails({agentSelection:'base'});
+  await ui.element('download-conversation').onclick();
+  assert.deepEqual(requests, ['/api/conversation/download?agent_selection=live']);
+});
+
+test('Conversation download finishes with its original details when Agents switch mid-request', async () => {
+  const requests = [];
+  let finishDownload;
+  const ui = await setup('websocket', {
+    URL:{createObjectURL:()=>'blob:recording', revokeObjectURL(){}},
+    fetch:async (url, options)=>{
+      if (url.startsWith('/api/conversation/download')) {
+        requests.push([url, JSON.parse(options.body)]);
+        return new Promise(resolve=>{finishDownload=resolve;});
+      }
+      const switching = url === '/api/agent/switch';
+      return {ok:true, json:async()=>({configured:true, exists:true, version:'1',
+        agent:switching ? 'demo-agent-live' : 'demo-agent',
+        model:switching ? 'gpt-live-1' : 'gpt-5.4', agentSelection:switching ? 'live' : 'base'})};
+    },
+  });
+  await ui.handleEvent(ui.session, {type:'bridge.conversation', conversationId:'conv_original', downloadToken:'signed-token'});
+  ui.stop();
+  const pendingDownload = ui.element('download-conversation').onclick();
+  ui.element('agent-model-choice').value = 'gpt-live-1';
+  await ui.element('save-model').onclick();
+  assert.equal(ui.element('agent').textContent, 'demo-agent-live');
+  assert.equal(ui.element('download-status').textContent, '');
+  finishDownload({ok:true, headers:{get:()=>'application/zip'}, blob:async()=>new Blob(['archive'])});
+  await pendingDownload;
+  assert.deepEqual(requests, [['/api/conversation/download', {downloadToken:'signed-token'}]]);
+  const link = ui.created.find(element=>element.tag === 'a');
+  assert.equal(link.download, 'conversation-conv_original.zip');
+  assert.equal(link.clicked, true);
+  assert.match(ui.element('download-status').textContent, /Download ready/);
+  assert.equal(ui.element('download-conversation').disabled, true);
 });
 
 test('Scenery controls remain outside the panels they hide', async () => {

@@ -8,13 +8,6 @@ from urllib.parse import quote
 
 import aiohttp
 
-# OpenAI's live BuiltInVoice catalog; availability still depends on the deployment.
-LIVE_VOICES = {
-    "alloy", "ash", "ballad", "beacon", "bossa", "cedar", "cinder", "coral",
-    "delta", "echo", "gleam", "marin", "meridian", "quartz", "ripple", "sage",
-    "shida", "shimmer", "stone", "tempo", "verse", "vesper", "willow",
-}
-
 
 class LiveSessionError(Exception):
     """A safe, actionable GPT Live startup or transport failure."""
@@ -69,6 +62,22 @@ def live_client_frame(raw, transport):
         raise ValueError("Expected a GPT Live event object.")
     if frame == {"type": "session.close"}:
         return frame
+    if transport == "websocket" and frame == {"type": "response.create"}:
+        return frame
+    if transport == "websocket" and frame.get("type") == "response.item.create":
+        item = frame.get("item")
+        if set(frame) != {"type", "item"} or not isinstance(item, dict) or set(item) != {"type", "role", "content"}:
+            raise ValueError("Send a GPT Live user text message without extra fields.")
+        content = item.get("content")
+        if item.get("type") != "message" or item.get("role") != "user":
+            raise ValueError("GPT Live text input must be a user message.")
+        if (not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict)
+                or set(content[0]) != {"type", "text"} or content[0].get("type") != "input_text"):
+            raise ValueError("GPT Live text input must contain one input_text part.")
+        text = content[0].get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+            raise ValueError("GPT Live text input must contain 1 to 4000 characters.")
+        return frame
     if transport == "websocket" and frame.get("type") == "session.input_audio.append":
         try:
             audio = base64.b64decode(frame.get("audio", ""), validate=True)
@@ -78,8 +87,8 @@ def live_client_frame(raw, transport):
             raise ValueError("GPT Live audio must be PCM16, at most one second per event.")
         return {"type": frame["type"], "audio": frame["audio"]}
     raise LiveSessionError(
-        "GPT Live accepts audio and end-call events here. Text-only replies and realtime "
-        "conversation-item controls are unavailable.")
+        "GPT Live accepts audio, user text messages, response requests and end-call events here. "
+        "Realtime conversation-item controls are unavailable.")
 
 
 def personalization_events(values):
@@ -161,7 +170,7 @@ async def relay_live(browser, upstream, on_conversation, personalization=None):
                 raise ValueError("Send GPT Live JSON events.")
             frame = live_client_frame(message.data, "websocket")
             if not ready.is_set():
-                raise LiveSessionError("Wait for GPT Live session.started before sending audio.")
+                raise LiveSessionError("Wait for GPT Live bridge readiness before sending audio or text.")
             await upstream.send_json(frame)
             if frame["type"] == "session.close":
                 async with asyncio.timeout(15):

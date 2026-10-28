@@ -196,8 +196,10 @@ sample without adding cross-replica creation coordination.
 The **Version** line shows the saved Agent's current version. End the call, choose
 `gpt-realtime-2.1`, **GPT Realtime 2.1 mini** (`gpt-realtime-2.1-mini`),
 `azure-realtime`, **Azure Realtime Flash**
-(`azure-realtime-flash-2026-10-14`), `gpt-5.4`, or **GPT Live**, then select **Save new version**.
+(`azure-realtime-flash-2026-10-14`), or `gpt-5.4`, then select **Save new version**.
 This publishes and enables a new version without deleting previous versions.
+GPT Live uses a different protocol. Its action creates or reuses a separate Agent,
+as described below, rather than publishing a version of the realtime Agent.
 Instructions, tools, metadata, and other configuration are preserved except for
 explicit transcription selections, turn-detection, and output-voice compatibility
 changes. A stale version, active call, or publication failure is reported rather
@@ -258,21 +260,40 @@ the configured resource. For the `va-dev-use2` project, the verified endpoint is
 `https://va-dev-use2.services.ai.azure.com/api/projects/va-dev-use2-project` and
 the Live deployment is `gpt-live-1-test`.
 
-Selecting **GPT Live** previews its native voice selector, defaulting to `marin`.
-Its choices follow the OpenAI SDK's
-[Live BuiltInVoice catalog](https://github.com/openai/openai-python/blob/main/src/openai/types/live/built_in_voice.py);
-availability depends on the deployed model. Unsupported voices fail explicitly,
-without substituting an Azure Speech or Azure Realtime voice. Saving the model
-publishes a Live version with a Responses backend and `web_search` for any topic,
+GPT Live uses the voice in its saved Agent definition (`marin` for newly created
+companions). There is no per-call voice selector: the Live endpoint rejects
+the realtime `x-ms-voice-session-override` header with HTTP 400. To change the
+Live voice, update the saved Agent definition instead.
+
+Foundry does not allow changing `sub_protocol` across versions of the same Agent.
+End the call, select **GPT Live**, then select **Create or use GPT Live Agent**.
+This creates and enables `<configured-agent-name>-live` with `sub_protocol: live`,
+or reuses the saved companion on subsequent visits. Long names get a shortened,
+hashed suffix to stay within the Agent name limit. A conflicting existing name
+is rejected, not overwritten. The original realtime Agent is never changed or
+deleted by this action. The selection is stored per tab in `sessionStorage` and
+sent explicitly with API requests and WebSocket connections. Reloading retains
+that tab's selection; switching another tab does not change it or its recording
+downloads. Legacy selection cookies are ignored. If browser storage is unavailable,
+selection lasts until reload. The server's environment settings remain unchanged.
+No Agent is created just by selecting the model or loading the page.
+
+Select a realtime model and **Use realtime Agent** to reconnect to the original
+saved realtime Agent. Its saved model and transcription are retained; after
+switching, **Save new version** can change those settings normally. If the
+configured original Agent is Live, configure `AZURE_VOICE_AGENT_NAME` to use a
+separate realtime Agent instead. Reset is disabled for Live Agents.
+
+The `live_definition` helper in `live.py` builds the initial Live definition with
+a Responses backend and `web_search` for any topic,
 including news, products, prices, documentation, travel, local information, and
 weather. Explicit lookup requests and facts needing verification trigger search;
 it is not limited to weather or current events. It does not attach the realtime
 weather Toolbox.
-The source instructions are supplied to that backend; its original complete
-realtime definition remains in the previous version. Version metadata records
-that source version so switching back restores its prompt, structured inputs,
-greeting, tools, audio settings and transcription before applying the selected
-realtime model/transcription.
+The original realtime Agent's source instructions are supplied to that backend
+when the companion is first created. Later switches reuse the saved Live
+definition without republishing it. You can also configure
+`AZURE_VOICE_AGENT_NAME` to use an existing standalone Live Agent directly.
 The deployment script passes both Live deployment settings to Azure Container
 Apps, and `check_websocket.py` detects Live Agents and checks native startup
 and graceful close without sending microphone audio.
@@ -290,9 +311,15 @@ for final cumulative usage.
 
 GPT Live listens and speaks concurrently. Its timed transcript fragments are
 shown as **captions, not authoritative retained history**; there is no realtime
-truncation handshake or complete-turn guarantee. Independent transcription,
-text-only replies, and realtime conversation-item retrieval are disabled for
-Live. Browser echo cancellation/noise suppression still apply, but the
+truncation handshake or complete-turn guarantee. Typed messages use native Live
+`response.item.create` followed by a bare `response.create` to invoke the existing
+Responses delegation backend. Its `response.event` text deltas are displayed
+separately from speech captions, with completion and failure status; they are not
+realtime retained history. Spoken replies may also play through the active voice
+session. Muting sends silence rather than stopping the audio stream, so voice
+usage remains billable while typing. Independent transcription and realtime
+conversation-item retrieval remain disabled for Live.
+Browser echo cancellation/noise suppression still apply, but the
 realtime Agent's Azure headset denoiser/VAD settings do not. Optional
 personalization becomes trusted language-policy and untrusted-context append
 events after `session.started`, rather than a realtime AI greeting. The bridge
@@ -382,9 +409,8 @@ To broaden an existing weather-only Agent, publish a new Toolbox version with
 the general-search descriptions, then publish an Agent version with the updated
 prompt and pinned Toolbox version; no reset or deletion is required. For a Live
 Agent, update both its speech instructions and Responses backend instructions.
-If it has a `realtime_source_version`, publish the updated realtime source too
-and point the Live version's metadata to it, so switching back retains general
-search. The UI advertises web search for new demo setup or when the saved Agent
+If you maintain a separate realtime Agent, update its prompt and Toolbox version
+independently. The UI advertises web search for new demo setup or when the saved Agent
 has the legacy weather reference.
 If publishing `personalized-agent.json` manually, provision the referenced
 Toolbox first; automatic setup resolves the actual immutable version for you.
@@ -422,13 +448,17 @@ can reset the configured demo Agent** after confirming its name; the dialog is a
 accident-prevention measure, not authentication. Use Entra sign-in for restricted
 access.
 
-For either transport, type in **Message your agent** and press **Enter** or
+For realtime models on either transport, type in **Message your agent** and press **Enter** or
 **Send** once connected. Submitted text appears in the conversation and requests
 a text-only reply. Microphone turns still use the saved agent's output settings.
 Messages are limited to 4,000 characters;
 the Send button waits while you are speaking or the agent is generating a reply.
 Mute the microphone to converse by text without spoken replies to typed messages.
 Session startup still requires microphone permission, even if you only plan to type.
+For GPT Live on WebSocket, the same composer sends native Live user-text events
+to the Responses backend and waits for backend completion before allowing another
+message. Unlike realtime typed turns, this does not request text-only output or
+disable spoken replies; the full-duplex audio session continues alongside text.
 
 Spoken turns reserve a **You** bubble when speech starts, showing **Listening...**
 and then **Transcribing...** until text arrives. Azure Realtime can start its

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import hashlib
 import hmac
 import json
 import logging
@@ -15,7 +16,7 @@ import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -25,7 +26,7 @@ from aiohttp import web
 from dotenv import load_dotenv
 
 from auth import AuthenticationError, AzureTokenProvider, authentication_mode, find_azure_cli
-from live import LIVE_VOICES, LiveSessionError, connect_live, live_definition
+from live import LiveSessionError, connect_live, live_definition
 
 ROOT = Path(__file__).resolve().parent
 LOGGER = logging.getLogger(__name__)
@@ -85,7 +86,10 @@ class SessionConfiguration:
         expected = self.update["session"]
         stable = "audio" in expected
         expected_vad = expected["audio"]["input"]["turn_detection"] if stable else expected["turn_detection"]
-        vad = ((session.get("audio") or {}).get("input") or {}).get("turn_detection") if stable else session.get("turn_detection")
+        vad = (
+            ((session.get("audio") or {}).get("input") or {}).get("turn_detection")
+            if stable else session.get("turn_detection")
+        )
         include = session.get("include", [])
         if (session.get("id") != self.session_id or not isinstance(vad, dict)
                 or vad.get("auto_truncate") is not expected_vad["auto_truncate"]
@@ -106,7 +110,8 @@ DEFAULT_AGENT_NAME = "webrtc-personalized-hd-demo"
 WEATHER_TOOLBOX_NAME = "weather"
 LANGUAGES = {"en-US": "English", "es-ES": "Spanish"}
 HD_VOICES = {f"en-US-{name}:DragonHDLatestNeural" for name in ("Tessa", "Tyler", "Paige", "Colin", "Brian", "Emma")} | {
-    "en-IN-Diya:DragonHDLatestNeural", "zh-CN-Xiaoqi:DragonHDFlashLatestNeural", "zh-CN-Xiaoke:DragonHDFlashLatestNeural"}
+    "en-IN-Diya:DragonHDLatestNeural", "zh-CN-Xiaoqi:DragonHDFlashLatestNeural",
+    "zh-CN-Xiaoke:DragonHDFlashLatestNeural"}
 MAI_FLASH_VOICES = {"en-US-Harper:MAI-Voice-2.1-Flash", "en-GB-Harry:MAI-Voice-2.1-Flash"}
 NATIVE_VOICES = {"ava", "andrew", "emma", "clara", "liam", "natasha", "rayn", "alvaro", "dalia", "jorge"}
 FLASH_MODEL = "azure-realtime-flash-2026-10-14"
@@ -145,8 +150,10 @@ def verify_download_token(secret, agent, token):
         parts = token.split(".")
         if len(parts) != 2:
             raise ValueError
-        payload, signature = (base64.b64decode(part + "=" * (-len(part) % 4),
-                                              altchars=b"-_", validate=True) for part in parts)
+        payload, signature = (
+            base64.b64decode(part + "=" * (-len(part) % 4), altchars=b"-_", validate=True)
+            for part in parts
+        )
         if not hmac.compare_digest(signature, hmac.digest(secret, payload, "sha256")):
             raise ValueError
         claims = json.loads(payload)
@@ -170,7 +177,8 @@ async def recorded_json(response):
             "Check the server identity's conversation-read permissions.")
     raw = await response.content.read(MAX_LOG_BYTES + 1)
     if len(raw) > MAX_LOG_BYTES:
-        raise ConversationDownloadError("The conversation log exceeds this demo's 16 MiB limit. Use Foundry to download it.", 413)
+        raise ConversationDownloadError(
+            "The conversation log exceeds this demo's 16 MiB limit. Use Foundry to download it.", 413)
     result = json.loads(raw)
     if not isinstance(result, dict):
         raise ConversationDownloadError("Foundry returned an invalid conversation log.")
@@ -188,10 +196,12 @@ async def write_conversation_archive(client, cfg, headers, conversation, output)
                 if record.get("status") == "completed":
                     break
                 if record.get("status") in {"failed", "canceled", "cancelled"}:
-                    raise ConversationDownloadError("The stored conversation did not complete successfully. Check its records in Foundry.", 409)
+                    raise ConversationDownloadError(
+                        "The stored conversation did not complete successfully. Check its records in Foundry.", 409)
         await asyncio.sleep(2)
     else:
-        raise ConversationDownloadError("Azure is still finalizing this recording. Wait a little, then download again.", 409)
+        raise ConversationDownloadError(
+            "Azure is still finalizing this recording. Wait a little, then download again.", 409)
 
     items, cursors, log_bytes = [], set(), 0
     params = {**query, "limit": 100, "order": "asc"}
@@ -200,7 +210,8 @@ async def write_conversation_archive(client, cfg, headers, conversation, output)
             page, size = await recorded_json(response)
         log_bytes += size
         if log_bytes > MAX_LOG_BYTES:
-            raise ConversationDownloadError("The conversation log exceeds this demo's 16 MiB limit. Use Foundry to download it.", 413)
+            raise ConversationDownloadError(
+                "The conversation log exceeds this demo's 16 MiB limit. Use Foundry to download it.", 413)
         if not isinstance(page.get("data"), list) or type(page.get("has_more")) is not bool:
             raise ConversationDownloadError("Foundry returned an invalid conversation items page.")
         items.extend(page["data"])
@@ -238,13 +249,14 @@ async def write_conversation_archive(client, cfg, headers, conversation, output)
                     raise ConversationDownloadError("Foundry did not return a WAV recording. No download was created.")
                 break
         else:
-            raise ConversationDownloadError("Azure is still preparing the audio. Wait a little, then download again.", 409)
+            raise ConversationDownloadError(
+                "Azure is still preparing the audio. Wait a little, then download again.", 409)
 
 
 async def download_conversation(request):
     if not allowed_origin(request):
         return web.json_response({"error": "Open the page on this server."}, status=403)
-    cfg = request.app[SETTINGS]
+    cfg = settings_for_request(request)
     try:
         body = await request.json()
     except ValueError:
@@ -278,11 +290,13 @@ async def download_conversation(request):
         LOGGER.warning("Conversation download failed (%s)", type(error).__name__)
         if response is not None and response.prepared:
             raise
-        return web.json_response({"error": "Could not download the stored conversation. Check Azure access and retry after the recording is finalized."}, status=502)
+        return web.json_response({"error": "Could not download the stored conversation. "
+                                  "Check Azure access and retry after the recording is finalized."}, status=502)
 
 
 def personalization_header(frame):
-    if not isinstance(frame, dict) or set(frame) != {"type", "display_name", "user_context", "client_language", "english_only"}:
+    if (not isinstance(frame, dict)
+            or set(frame) != {"type", "display_name", "user_context", "client_language", "english_only"}):
         raise ValueError("Invalid personalization fields.")
     if frame["type"] != "bridge.personalize" or type(frame["english_only"]) is not bool:
         raise ValueError("Invalid personalization request.")
@@ -344,6 +358,8 @@ class Settings:
     allow_agent_recreate: bool = False
     live_deployment: str = "gpt-live-1"
     live_backend_deployment: str = "gpt-5.4"
+    companion_of: str = ""
+    companion_protocol: str = ""
 
     def __post_init__(self):
         object.__setattr__(self, "agent", self.agent.strip() or DEFAULT_AGENT_NAME)
@@ -389,6 +405,22 @@ class Settings:
         query = urlencode(params)
         return (f"{project}/agents/"
                 f"{quote(self.agent, safe='')}/endpoint/protocols/voice?{query}")
+
+
+def companion_settings(cfg, protocol):
+    name = f"{cfg.agent}-{protocol}"
+    if len(name) > 63:
+        digest = hashlib.sha256(cfg.agent.encode()).hexdigest()[:8]
+        name = f"{cfg.agent[:42].rstrip('-')}-{digest}-{protocol}"
+    return replace(cfg, agent=name, companion_of=cfg.agent, companion_protocol=protocol)
+
+
+def settings_for_request(request):
+    cfg = request.app[SETTINGS]
+    protocol = request.query.get("agent_selection", "base")
+    if protocol not in {"base", "live"}:
+        raise web.HTTPBadRequest(text="Choose base or live Agent selection.")
+    return companion_settings(cfg, "live") if protocol == "live" else cfg
 
 
 def load_settings():
@@ -440,7 +472,7 @@ async def security_headers(request, handler):
 
 
 async def public_config(request):
-    cfg = request.app[SETTINGS]
+    cfg = settings_for_request(request)
     auth_mode = authentication_mode()
     return web.json_response({"configured": cfg.configured, "agent": cfg.agent,
                               "iceServers": list(cfg.ice_servers),
@@ -450,7 +482,6 @@ async def public_config(request):
                               "personalizationRequired": cfg.personalization_required,
                               "agentRecreateAllowed": cfg.allow_agent_recreate,
                               "models": sorted(MODELS | {LIVE_MODEL}),
-                              "liveVoices": sorted(LIVE_VOICES),
                               "transcriptionModels": sorted(TRANSCRIPTION_MODELS),
                               "defaultTranscriptionModel": DEFAULT_TRANSCRIPTION_MODEL,
                               "transports": ["websocket", "webrtc"], "defaultTransport": "websocket"})
@@ -489,18 +520,21 @@ async def prepare_weather_toolbox(client, cfg, headers):
                                    allow_redirects=False) as published:
                 if published.status not in {200, 201}:
                     raise AgentPreparationError(
-                        f"Weather Toolbox creation failed (HTTP {published.status}). Check Toolbox permissions and web search availability. No Agent was created.")
+                        f"Weather Toolbox creation failed (HTTP {published.status}). "
+                        "Check Toolbox permissions and web search availability. No Agent was created.")
                 version = await published.json()
         else:
             raise AgentPreparationError(
-                f"Weather Toolbox lookup failed (HTTP {response.status}). Check Toolbox permissions. No Agent was created.")
+                f"Weather Toolbox lookup failed (HTTP {response.status}). "
+                "Check Toolbox permissions. No Agent was created.")
     number = version.get("version") if isinstance(version, dict) else None
     tools = version.get("tools") if isinstance(version, dict) else None
     if (not isinstance(number, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", number)
             or number.lower() == "latest" or not isinstance(tools, list) or not any(
                 isinstance(tool, dict) and tool.get("type") == "web_search" for tool in tools)):
         raise AgentPreparationError(
-            "The weather Toolbox must have a published version containing a web_search tool. It was not overwritten; no Agent was created.")
+            "The weather Toolbox must have a published version containing a web_search tool. "
+            "It was not overwritten; no Agent was created.")
     return {"type": "toolbox", "toolbox_name": WEATHER_TOOLBOX_NAME, "toolbox_version": number}
 
 
@@ -513,18 +547,27 @@ async def lookup_configured_agent(client, cfg, headers, *, include_version=False
             definition = latest.get("definition") or {}
             if definition.get("kind") != "voice":
                 raise AgentPreparationError("The configured Agent exists but is not a voice Agent. It was not changed.")
-            if cfg.personalization_required:
+            if cfg.companion_of and (
+                    (latest.get("metadata") or {}).get("companion_of") != cfg.companion_of
+                    or (definition.get("sub_protocol") == "live") != (cfg.companion_protocol == "live")):
+                raise AgentPreparationError(
+                    "The companion Agent name is already in use by another configuration. It was not changed.")
+            if cfg.personalization_required and definition.get("sub_protocol") != "live":
                 if not required.issubset(definition.get("structured_inputs") or {}):
-                    raise AgentPreparationError("The existing Agent lacks the demo structured inputs. Choose a new Agent name; it was not overwritten.")
+                    raise AgentPreparationError(
+                        "The existing Agent lacks the demo structured inputs. "
+                        "Choose a new Agent name; it was not overwritten.")
             return latest if include_version else definition
         elif response.status == 404:
             # Verify the project API exists before interpreting an Agent 404 as absence.
             async with client.get(cfg.agent_url(collection=True), headers=headers, allow_redirects=False) as project:
                 if project.status != 200:
-                    raise AgentPreparationError(f"Cannot verify the project Agents API (HTTP {project.status}). No Agent was created.")
+                    raise AgentPreparationError(
+                        f"Cannot verify the project Agents API (HTTP {project.status}). No Agent was created.")
             return None
         else:
-            raise AgentPreparationError(f"Agent lookup failed (HTTP {response.status}). Check Foundry permissions; no Agent was created.")
+            raise AgentPreparationError(
+                f"Agent lookup failed (HTTP {response.status}). Check Foundry permissions; no Agent was created.")
 
 
 def transcription_model(definition):
@@ -539,8 +582,8 @@ async def inspect_configured_agent(client, cfg, headers):
     required = set(demo["structured_inputs"])
     return {"agent": cfg.agent, "exists": definition is not None,
             "model": (demo if definition is None else definition).get("model"),
-            "modelChoice": LIVE_MODEL if (definition or {}).get("sub_protocol") == "live" else
-                (demo if definition is None else definition).get("model"),
+            "modelChoice": (LIVE_MODEL if (definition or {}).get("sub_protocol") == "live" else
+                            (demo if definition is None else definition).get("model")),
             "transcriptionModel": transcription_model(demo if definition is None else definition),
             "version": latest.get("version") if latest is not None else None,
             "weatherEnabled": definition is not None and weather_toolbox_attached(definition),
@@ -548,37 +591,55 @@ async def inspect_configured_agent(client, cfg, headers):
                 definition is not None and required.issubset(definition.get("structured_inputs") or {}))}
 
 
-async def prepare_configured_agent(client, cfg, headers):
+async def prepare_configured_agent(client, cfg, headers, *, initial_definition=None):
     latest = await lookup_configured_agent(client, cfg, headers, include_version=True)
     definition = latest["definition"] if latest is not None else None
     version = latest.get("version") if latest is not None else None
     created = definition is None
     if created:
-        definition = json.loads((ROOT / "personalized-agent.json").read_text())
+        if cfg.companion_protocol == "live" and initial_definition is None:
+            raise AgentPreparationError("Use Create or use GPT Live Agent to prepare this missing Live Agent.")
+        definition = (copy.deepcopy(initial_definition) if initial_definition is not None else
+                      json.loads((ROOT / "personalized-agent.json").read_text()))
         if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", cfg.agent):
-            raise AgentPreparationError("The configured Agent name must be 1-63 alphanumeric/hyphen characters, starting and ending with an alphanumeric character.")
-        definition["tools"] = [await prepare_weather_toolbox(client, cfg, headers)]
-        url = f"{cfg.project_url()}/agents/{quote(cfg.agent, safe='')}/versions?{urlencode({'api-version': cfg.api_version})}"
+            raise AgentPreparationError(
+                "The configured Agent name must be 1-63 alphanumeric/hyphen characters, "
+                "starting and ending with an alphanumeric character.")
+        if definition.get("sub_protocol") != "live":
+            definition["tools"] = [await prepare_weather_toolbox(client, cfg, headers)]
+        metadata = {"sample": "foundry_voice_webrtc"}
+        if cfg.companion_of:
+            metadata["companion_of"] = cfg.companion_of
+        url = (
+            f"{cfg.project_url()}/agents/{quote(cfg.agent, safe='')}/versions?"
+            f"{urlencode({'api-version': cfg.api_version})}"
+        )
         async with client.post(url, headers=headers, json={
-            "definition": definition, "metadata": {"sample": "foundry_voice_webrtc"}
+            "definition": definition, "metadata": metadata
         }, allow_redirects=False) as publish:
             if publish.status not in {200, 201}:
-                raise AgentPreparationError(f"Agent creation failed (HTTP {publish.status}). Check creation permissions and model/voice availability.")
+                raise AgentPreparationError(
+                    f"Agent creation failed (HTTP {publish.status}). "
+                    "Check creation permissions and model/voice availability.")
             published = await publish.json()
             if not isinstance(published, dict) or not isinstance(published.get("version"), str):
-                raise AgentPreparationError("The Agent was published but its version could not be verified. Retry setup without resetting.")
+                raise AgentPreparationError(
+                    "The Agent was published but its version could not be verified. Retry setup without resetting.")
             version = published["version"]
     url = f"{cfg.project_url()}/agents/{quote(cfg.agent, safe='')}:enable?{urlencode({'api-version': cfg.api_version})}"
     async with client.post(url, headers=headers, allow_redirects=False) as enabled:
         if enabled.status != 204:
-            raise AgentPreparationError(f"Agent enable failed (HTTP {enabled.status}). Retry preparation; an existing version will not be overwritten.")
+            raise AgentPreparationError(
+                f"Agent enable failed (HTTP {enabled.status}). "
+                "Retry preparation; an existing version will not be overwritten.")
     required = set(json.loads((ROOT / "personalized-agent.json").read_text())["structured_inputs"])
     return {"agent": cfg.agent, "created": created, "model": definition.get("model"),
             "modelChoice": LIVE_MODEL if definition.get("sub_protocol") == "live" else definition.get("model"),
             "transcriptionModel": transcription_model(definition),
             "version": version,
             "weatherEnabled": weather_toolbox_attached(definition),
-            "personalizationRequired": cfg.personalization_required or required.issubset(definition.get("structured_inputs") or {})}
+            "personalizationRequired": (cfg.personalization_required
+                                        or required.issubset(definition.get("structured_inputs") or {}))}
 
 
 def model_definition(definition, model, transcription=None):
@@ -636,7 +697,7 @@ def redact_settings(value):
 
 
 async def agent_settings(request):
-    cfg = request.app[SETTINGS]
+    cfg = settings_for_request(request)
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35)) as client:
             token = await request.app[TOKENS].get_token(client)
@@ -644,29 +705,39 @@ async def agent_settings(request):
                 "Authorization": f"Bearer {token}", "Foundry-Features": cfg.features}, include_version=True)
         if latest is None:
             return web.json_response({"error": "Create the Agent before viewing saved settings."}, status=404)
-        text = yaml.dump(redact_settings({"name": cfg.agent, "version": latest.get("version"),
-            "definition": latest["definition"]}), Dumper=AgentYamlDumper, sort_keys=False, allow_unicode=True)
-        return web.json_response({"yaml": text, "model": latest["definition"].get("model"),
-                                  "transcriptionModel": transcription_model(latest["definition"]), "version": latest.get("version")})
+        text = yaml.dump(redact_settings({
+            "name": cfg.agent, "version": latest.get("version"), "definition": latest["definition"]
+        }), Dumper=AgentYamlDumper, sort_keys=False, allow_unicode=True)
+        return web.json_response({
+            "yaml": text, "model": latest["definition"].get("model"),
+            "transcriptionModel": transcription_model(latest["definition"]), "version": latest.get("version")
+        })
     except (AuthenticationError, AgentPreparationError, aiohttp.ClientError, TimeoutError, ValueError) as error:
         LOGGER.warning("Agent settings lookup failed (%s)", type(error).__name__)
-        return web.json_response({"error": "Could not read saved Agent settings. Check Foundry access and retry."}, status=502)
+        return web.json_response(
+            {"error": "Could not read saved Agent settings. Check Foundry access and retry."}, status=502)
 
 
 async def change_agent_model(request):
     if not allowed_origin(request):
         return web.json_response({"error": "Open the page on this server."}, status=403)
-    cfg = request.app[SETTINGS]
+    cfg = settings_for_request(request)
     try:
         body = await request.json()
     except ValueError:
         return web.json_response({"error": "Choose a model and the current Agent version."}, status=400)
-    if (not isinstance(body, dict) or set(body) not in ({"model", "version"}, {"model", "version", "transcriptionModel"})
-            or not isinstance(body["model"], str) or body["model"] not in MODELS | {LIVE_MODEL}
-            or not isinstance(body["version"], str) or not body["version"]
-            or ("transcriptionModel" in body and (
-                not isinstance(body["transcriptionModel"], str) or body["transcriptionModel"] not in TRANSCRIPTION_MODELS))):
-        return web.json_response({"error": "Choose supported Agent/transcription models and the current Agent version."}, status=400)
+    if (
+        not isinstance(body, dict)
+        or set(body) not in ({"model", "version"}, {"model", "version", "transcriptionModel"})
+        or not isinstance(body["model"], str) or body["model"] not in MODELS | {LIVE_MODEL}
+        or not isinstance(body["version"], str) or not body["version"]
+        or ("transcriptionModel" in body and (
+            not isinstance(body["transcriptionModel"], str)
+            or body["transcriptionModel"] not in TRANSCRIPTION_MODELS
+        ))
+    ):
+        return web.json_response(
+            {"error": "Choose supported Agent/transcription models and the current Agent version."}, status=400)
     async with request.app[PREPARATION]:
         if request.app[ACTIVE].active:
             return web.json_response({"error": "End the conversation before changing its model."}, status=409)
@@ -678,35 +749,25 @@ async def change_agent_model(request):
                 if latest is None:
                     return web.json_response({"error": "Create the Agent before changing its model."}, status=404)
                 if latest.get("version") != body["version"]:
-                    return web.json_response({"error": "The Agent version changed. Reload the page before saving."}, status=409)
+                    return web.json_response(
+                        {"error": "The Agent version changed. Reload the page before saving."}, status=409)
                 expected_version = latest["version"]
                 metadata = copy.deepcopy(latest.get("metadata") or {})
                 source = latest["definition"]
                 was_live = source.get("sub_protocol") == "live"
+                if was_live != (body["model"] == LIVE_MODEL):
+                    return web.json_response({"error": (
+                        "Foundry does not allow changing a voice Agent's sub_protocol across versions. "
+                        "GPT Live requires a separate Agent created with sub_protocol=live; "
+                        "configure AZURE_VOICE_AGENT_NAME to use that Agent. "
+                        "The current Agent and its previous versions were not changed."
+                    )}, status=409)
                 if body["model"] == LIVE_MODEL:
                     if "transcriptionModel" in body:
-                        raise AgentPreparationError("GPT Live owns transcription; do not select a separate transcription model.")
-                    if was_live:
-                        definition = copy.deepcopy(source)
-                    else:
-                        if not cfg.live_deployment or not cfg.live_backend_deployment:
-                            raise AgentPreparationError("Configure GPT_LIVE_DEPLOYMENT and GPT_LIVE_BACKEND_DEPLOYMENT.")
-                        definition = live_definition(source, cfg.live_deployment, cfg.live_backend_deployment)
-                        metadata["realtime_source_version"] = latest["version"]
+                        raise AgentPreparationError(
+                            "GPT Live owns transcription; do not select a separate transcription model.")
+                    definition = copy.deepcopy(source)
                 else:
-                    if was_live:
-                        version = metadata.get("realtime_source_version")
-                        if not isinstance(version, str) or not version:
-                            raise AgentPreparationError("This GPT Live Agent has no original realtime version to restore. Choose a separate realtime Agent.")
-                        url = f"{cfg.project_url()}/agents/{quote(cfg.agent, safe='')}/versions/{quote(version, safe='')}"
-                        async with client.get(url, params={"api-version": cfg.api_version}, headers=headers,
-                                              allow_redirects=False) as response:
-                            if response.status != 200:
-                                raise AgentPreparationError("Could not read the original realtime version. No replacement was saved.")
-                            source = (await response.json()).get("definition")
-                        if not isinstance(source, dict) or source.get("sub_protocol") == "live":
-                            raise AgentPreparationError("The original realtime definition could not be verified.")
-                        metadata.pop("realtime_source_version", None)
                     if body["model"] == FLASH_MODEL and "greeting" in source:
                         metadata.setdefault("flash_greeting", json.dumps(source["greeting"]))
                     elif body["model"] != FLASH_MODEL and "flash_greeting" in metadata:
@@ -720,35 +781,107 @@ async def change_agent_model(request):
                                            allow_redirects=False) as response:
                         if response.status not in {200, 201}:
                             raise AgentPreparationError(
-                                f"Model change failed (HTTP {response.status}). The Agent/transcription model or audio settings may be unavailable in this project. Previous versions were not deleted.")
+                                f"Model change failed (HTTP {response.status}). "
+                                "The Agent/transcription model or audio settings may be unavailable in this project. "
+                                "Previous versions were not deleted.")
                         published = await response.json()
                         if not isinstance(published, dict) or not isinstance(published.get("version"), str):
-                            raise AgentPreparationError("A version may have been saved, but its number could not be verified. Reload before retrying.")
+                            raise AgentPreparationError(
+                                "A version may have been saved, but its number could not be verified. "
+                                "Reload before retrying.")
                         expected_version = published["version"]
                 url = f"{cfg.project_url()}/agents/{quote(cfg.agent, safe='')}:enable"
                 async with client.post(url, params={"api-version": cfg.api_version}, headers=headers,
                                        allow_redirects=False) as response:
                     if response.status != 204:
-                        raise AgentPreparationError("The model version was saved but could not be enabled. Retry setup before starting a call.")
+                        raise AgentPreparationError(
+                            "The model version was saved but could not be enabled. "
+                            "Retry setup before starting a call.")
                 result = await inspect_configured_agent(client, cfg, headers)
                 if (result.get("version") != expected_version or result.get("modelChoice") != body["model"]
-                        or ("transcriptionModel" in body and result.get("transcriptionModel") != body["transcriptionModel"])):
-                    raise AgentPreparationError("The saved settings changed or could not be verified. Reload before retrying.")
+                        or ("transcriptionModel" in body
+                            and result.get("transcriptionModel") != body["transcriptionModel"])):
+                    raise AgentPreparationError(
+                        "The saved settings changed or could not be verified. Reload before retrying.")
                 return web.json_response(result)
         except (AuthenticationError, AgentPreparationError) as error:
             LOGGER.warning("Agent model change failed (%s)", type(error).__name__)
             return web.json_response({"error": str(error)}, status=502)
         except (aiohttp.ClientError, TimeoutError, ValueError) as error:
             LOGGER.warning("Agent model change failed (%s)", type(error).__name__)
-            return web.json_response({"error": "The model change could not be verified. Reload before retrying; a new version may have been saved."}, status=502)
+            return web.json_response({"error": "The model change could not be verified. "
+                                      "Reload before retrying; a new version may have been saved."}, status=502)
+
+
+async def switch_agent(request):
+    if not allowed_origin(request):
+        return web.json_response({"error": "Open the page on this server."}, status=403)
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response({"error": "Choose a model and the current Agent version."}, status=400)
+    if (not isinstance(body, dict) or set(body) != {"model", "version"}
+            or not isinstance(body["model"], str) or body["model"] not in MODELS | {LIVE_MODEL}
+            or not isinstance(body["version"], str) or not body["version"]):
+        return web.json_response({"error": "Choose a supported model and the current Agent version."}, status=400)
+    cfg, base = settings_for_request(request), request.app[SETTINGS]
+    protocol = "live" if body["model"] == LIVE_MODEL else "realtime"
+    async with request.app[PREPARATION]:
+        if request.app[ACTIVE].active:
+            return web.json_response({"error": "End the conversation before switching Agents."}, status=409)
+        try:
+            async with asyncio.timeout(90), aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as client:
+                token = await request.app[TOKENS].get_token(client)
+                headers = {"Authorization": f"Bearer {token}", "Foundry-Features": cfg.features}
+                current = await lookup_configured_agent(client, cfg, headers, include_version=True)
+                if current is None or current.get("version") != body["version"]:
+                    return web.json_response(
+                        {"error": "The Agent version changed. Reload before switching."}, status=409)
+                original = current if cfg.agent == base.agent else await lookup_configured_agent(
+                    client, base, headers, include_version=True)
+                if original is None:
+                    raise AgentPreparationError("The configured original Agent is missing. It was not recreated.")
+                original_live = original["definition"].get("sub_protocol") == "live"
+                if original_live and protocol != "live":
+                    return web.json_response({"error": (
+                        "The configured Agent is Live. Configure AZURE_VOICE_AGENT_NAME to use a separate "
+                        "realtime Agent. No Agent was created or changed."
+                    )}, status=409)
+                target = base if original_live == (protocol == "live") else companion_settings(base, protocol)
+                initial = None
+                if target.companion_protocol == "live":
+                    if not cfg.live_deployment or not cfg.live_backend_deployment:
+                        raise AgentPreparationError("Configure GPT_LIVE_DEPLOYMENT and GPT_LIVE_BACKEND_DEPLOYMENT.")
+                    initial = live_definition(original["definition"], cfg.live_deployment, cfg.live_backend_deployment)
+                prepared = await prepare_configured_agent(client, target, headers, initial_definition=initial)
+                result = await inspect_configured_agent(client, target, headers)
+                if (not result["exists"] or result["version"] != prepared["version"]
+                        or (result["modelChoice"] == LIVE_MODEL) != (protocol == "live")):
+                    raise AgentPreparationError(
+                        "The target Agent could not be verified. Your selection was not changed.")
+                return web.json_response({**result, "created": prepared["created"],
+                                          "agentSelection": target.companion_protocol or "base"})
+        except (AuthenticationError, AgentPreparationError) as error:
+            LOGGER.warning("Agent switch failed (%s)", type(error).__name__)
+            return web.json_response({"error": str(error)}, status=502)
+        except (aiohttp.ClientError, TimeoutError, ValueError, OSError) as error:
+            LOGGER.warning("Agent switch failed (%s)", type(error).__name__)
+            return web.json_response({"error": (
+                "Could not verify the target Agent. Your selection was not changed; "
+                "retry to reuse any saved Agent."
+            )}, status=502)
 
 
 async def recreate_configured_agent(client, cfg, headers):
+    if cfg.companion_of:
+        await lookup_configured_agent(client, cfg, headers)
     async with client.get(cfg.agent_url(), headers=headers, allow_redirects=False) as response:
         if response.status == 200:
             agent = await response.json()
             latest = (agent.get("versions") or {}).get("latest") or {}
             definition = latest.get("definition") or {}
+            if definition.get("sub_protocol") == "live":
+                raise AgentPreparationError("Reset is not supported for Live Agents. No Agent was deleted.")
             demo = json.loads((ROOT / "personalized-agent.json").read_text())
             # Also recognize the earlier demo versions published before ownership metadata.
             owned = ((latest.get("metadata") or {}).get("sample") == "foundry_voice_webrtc"
@@ -761,23 +894,29 @@ async def recreate_configured_agent(client, cfg, headers):
                              demo["instructions"].partition("\n\nTURN FOCUS AND CAPABILITIES")[0],
                              demo["instructions"].partition("\n\nAGENT IDENTITY")[0]}))
             if not owned:
-                raise AgentPreparationError("The configured Agent is not recognized as this sample's demo Agent. It was not deleted.")
+                raise AgentPreparationError(
+                    "The configured Agent is not recognized as this sample's demo Agent. It was not deleted.")
         elif response.status != 404:
             raise AgentPreparationError(f"Agent lookup failed (HTTP {response.status}). No Agent was deleted.")
     await prepare_weather_toolbox(client, cfg, headers)
     if response.status == 200:
         async with client.delete(cfg.agent_url(), headers=headers, allow_redirects=False) as deleted:
             if deleted.status not in {200, 204, 404}:
-                raise AgentPreparationError(f"Agent removal failed (HTTP {deleted.status}). No replacement was published.")
+                raise AgentPreparationError(
+                    f"Agent removal failed (HTTP {deleted.status}). No replacement was published.")
         for _ in range(10):
             async with client.get(cfg.agent_url(), headers=headers, allow_redirects=False) as check:
                 if check.status == 404:
                     break
                 if check.status != 200:
-                    raise AgentPreparationError(f"Removal was requested but could not be verified (HTTP {check.status}). No replacement was published; use Retry setup & start to recover.")
+                    raise AgentPreparationError(
+                        f"Removal was requested but could not be verified (HTTP {check.status}). "
+                        "No replacement was published; use Retry setup & start to recover.")
             await asyncio.sleep(0.5)
         else:
-            raise AgentPreparationError("Removal was requested but the previous Agent is still visible. No replacement was published; wait and use Retry setup & start to recover.")
+            raise AgentPreparationError(
+                "Removal was requested but the previous Agent is still visible. "
+                "No replacement was published; wait and use Retry setup & start to recover.")
     try:
         result = await prepare_configured_agent(client, cfg, headers)
     except AgentPreparationError as error:
@@ -808,9 +947,10 @@ async def agent_status(request):
 async def manage_agent(request, *, recreate=False, inspect=False):
     if not inspect and not allowed_origin(request):
         return web.json_response({"error": "Open the page on this server."}, status=403)
-    cfg = request.app[SETTINGS]
+    cfg = settings_for_request(request)
     if not cfg.configured:
-        return web.json_response({"error": "Configure the Foundry project endpoint first. No existing Agent is required."}, status=503)
+        return web.json_response(
+            {"error": "Configure the Foundry project endpoint first. No existing Agent is required."}, status=503)
     if recreate:
         if not cfg.allow_agent_recreate:
             return web.json_response({"error": "Agent recreation is disabled by the server."}, status=403)
@@ -819,7 +959,8 @@ async def manage_agent(request, *, recreate=False, inspect=False):
         except (ValueError, aiohttp.ContentTypeError):
             return web.json_response({"error": "Confirm the configured Agent name before removal."}, status=400)
         if confirmation != {"confirm_agent": cfg.agent}:
-            return web.json_response({"error": "Confirmation must exactly match the configured Agent name."}, status=400)
+            return web.json_response(
+                {"error": "Confirmation must exactly match the configured Agent name."}, status=400)
     async with request.app[PREPARATION]:
         if not inspect and request.app[ACTIVE].active:
             return web.json_response({"error": "End the active conversation before preparing the Agent."}, status=409)
@@ -830,14 +971,22 @@ async def manage_agent(request, *, recreate=False, inspect=False):
                     recreate_configured_agent if recreate else prepare_configured_agent)
                 result = await operation(
                     client, cfg, {"Authorization": f"Bearer {token}", "Foundry-Features": cfg.features})
+                if inspect and not result["exists"] and cfg.companion_of:
+                    result = await inspect_configured_agent(client, request.app[SETTINGS], {
+                        "Authorization": f"Bearer {token}", "Foundry-Features": cfg.features})
+                    return web.json_response({**result, "agentSelection": "base"})
                 return web.json_response(result)
         except (AuthenticationError, AgentPreparationError) as error:
             LOGGER.warning("Agent preparation failed (%s)", type(error).__name__)
             return web.json_response({"error": str(error)}, status=502)
         except (aiohttp.ClientError, TimeoutError, ValueError, OSError) as error:
             LOGGER.warning("Agent preparation failed (%s)", type(error).__name__)
-            message = ("Agent reset could not be verified. Removal may have occurred. Use Retry setup & start to recover without resetting again."
-                       if recreate else "Agent preparation failed. Check Azure connectivity and the server's demo definition, then retry.")
+            message = (
+                "Agent reset could not be verified. Removal may have occurred. "
+                "Use Retry setup & start to recover without resetting again."
+                if recreate else
+                "Agent preparation failed. Check Azure connectivity and the server's demo definition, then retry."
+            )
             return web.json_response({"error": message}, status=502)
 
 
@@ -918,7 +1067,8 @@ async def forward_browser(browser, upstream, transport, configuration):
         if message.type == aiohttp.WSMsgType.TEXT:
             frame = validate_client_frame(message.data, started, transport)
             if not configuration.ready and frame["type"] not in {"rtc.call.sdp.create", "conversation.item.retrieve"}:
-                raise SessionConfigurationError("Wait for the retained-history configuration acknowledgment before sending input.")
+                raise SessionConfigurationError(
+                    "Wait for the retained-history configuration acknowledgment before sending input.")
             await upstream.send_json(frame)
             if frame["type"] == "session.close":
                 try:
@@ -945,7 +1095,10 @@ async def forward_upstream(upstream, browser, transport, configuration, on_conve
                         announced = True
                     acknowledged = await configuration.observe(frame, upstream)
                     # WebRTC plays RTP; WebSocket mode needs base64 PCM audio deltas.
-                    if transport == "websocket" or frame.get("type") not in {"response.audio.delta", "response.output_audio.delta"}:
+                    if (
+                        transport == "websocket"
+                        or frame.get("type") not in {"response.audio.delta", "response.output_audio.delta"}
+                    ):
                         await browser.send_str(message.data)
                     if acknowledged:
                         deadline.reschedule(None)
@@ -954,7 +1107,8 @@ async def forward_upstream(upstream, browser, transport, configuration, on_conve
                         configuration.closed.set()
                         return
     except TimeoutError:
-        raise SessionConfigurationError("Timed out waiting for Azure to acknowledge retained-history session configuration.") from None
+        raise SessionConfigurationError(
+            "Timed out waiting for Azure to acknowledge retained-history session configuration.") from None
 
 
 async def relay(browser, upstream, transport, on_conversation=None):
@@ -1049,23 +1203,47 @@ def describe_connection_error(error):
         return str(error)
     if isinstance(error, aiohttp.WSServerHandshakeError):
         if error.status == 401:
-            return "Foundry rejected the Azure CLI bearer token (HTTP 401). Run az login for the tenant containing this project and select the correct subscription. Resource API keys are not supported by Agent Service."
+            return (
+                "Foundry rejected the Azure CLI bearer token (HTTP 401). "
+                "Run az login for the tenant containing this project and select the correct subscription. "
+                "Resource API keys are not supported by Agent Service."
+            )
         if error.status == 403:
-            return "Foundry denied your signed-in account access (HTTP 403). Ask the resource owner to grant you the appropriate Foundry role on this project or agent and check network access policies."
-        return f"Azure rejected the WebSocket upgrade (HTTP {error.status}). Check the project endpoint, agent name and selected transport support."
+            return (
+                "Foundry denied your signed-in account access (HTTP 403). "
+                "Ask the resource owner to grant you the appropriate Foundry role on this project or agent "
+                "and check network access policies."
+            )
+        return (
+            f"Azure rejected the WebSocket upgrade (HTTP {error.status}). "
+            "Check the project endpoint, agent name and selected transport support."
+        )
     if isinstance(error, (aiohttp.ClientConnectorCertificateError, aiohttp.ClientConnectorSSLError)):
-        return "TLS certificate validation failed. Check trusted certificates and your network proxy; do not disable certificate validation."
+        return (
+            "TLS certificate validation failed. Check trusted certificates and your network proxy; "
+            "do not disable certificate validation."
+        )
     if isinstance(error, aiohttp.ClientConnectorError):
         cause = error.os_error
         if getattr(cause, "errno", None) in {1, 13} or getattr(cause, "winerror", None) in {5, 10013}:
-            return "The operating system denied the server's outbound connection to Azure. Run the server outside the restricted environment or allow Python outbound HTTPS to Entra and Foundry. Authentication has not completed."
+            return (
+                "The operating system denied the server's outbound connection to Azure. "
+                "Run the server outside the restricted environment or allow Python outbound HTTPS "
+                "to Entra and Foundry. "
+                "Authentication has not completed."
+            )
         if isinstance(error, aiohttp.ClientConnectorDNSError):
             return "Azure hostname lookup failed. Check the project endpoint and DNS/network connection."
-        return "The server could not reach Azure over HTTPS. Check the network, proxy and firewall. No Azure authentication response was received."
+        return (
+            "The server could not reach Azure over HTTPS. Check the network, proxy and firewall. "
+            "No Azure authentication response was received."
+        )
     if isinstance(error, TimeoutError):
         return "Connecting to Azure timed out. Check outbound HTTPS access, proxy and firewall settings."
     if isinstance(error, ValueError):
-        return "Invalid connection configuration or client audio event. Check the project endpoint and selected transport."
+        return (
+            "Invalid connection configuration or client audio event. Check the project endpoint and selected transport."
+        )
     return "The voice connection failed unexpectedly. Check the server log for the error type."
 
 
@@ -1075,7 +1253,7 @@ async def bridge(request):
     transport = request.query.get("transport", "webrtc")
     if transport not in TRANSPORTS:
         raise web.HTTPBadRequest(text="Choose websocket or webrtc.")
-    cfg = request.app[SETTINGS]
+    cfg = settings_for_request(request)
     if not cfg.configured:
         raise web.HTTPServiceUnavailable(text="Configure .env first.")
     # One active local call prevents accidental duplicate usage.
@@ -1088,9 +1266,9 @@ async def bridge(request):
     try:
         await browser.prepare(request)
         structured = None
-        voice = request.query.get("voice", "")
         live = request.query.get("protocol") == "live"
-        if voice and voice not in (LIVE_VOICES if live else HD_VOICES | MAI_FLASH_VOICES | NATIVE_VOICES):
+        voice = "" if live else request.query.get("voice", "")
+        if voice and voice not in HD_VOICES | MAI_FLASH_VOICES | NATIVE_VOICES:
             raise ValueError("Choose a supported demo output voice.")
         if cfg.personalization_required and request.query.get("personalize") != "true":
             raise ValueError("This Agent requires session personalization.")
@@ -1103,6 +1281,7 @@ async def bridge(request):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35)) as client:
             token = await request.app[TOKENS].get_token(client)
             headers = {"Authorization": f"Bearer {token}", "Foundry-Features": cfg.features}
+
             async def announce_conversation(conversation):
                 await browser.send_json({
                     "type": "bridge.conversation", "conversationId": conversation,
@@ -1112,8 +1291,6 @@ async def bridge(request):
                 latest = await lookup_configured_agent(client, cfg, headers, include_version=True)
                 if latest is None or latest["definition"].get("sub_protocol") != "live":
                     raise LiveSessionError("Save the GPT Live model version before starting a live session.")
-                if voice:
-                    headers["x-ms-voice-session-override"] = json.dumps({"audio": {"output": {"voice": voice}}})
                 await connect_live(client, browser, cfg, headers, transport, latest["version"], announce_conversation,
                                    json.loads(structured) if structured is not None else None)
                 return browser
@@ -1121,8 +1298,10 @@ async def bridge(request):
                 headers["x-ms-voice-structured-inputs"] = structured
             if voice:
                 headers["x-ms-voice-session-override"] = json.dumps({
-                    "audio": {"output": {"voice": voice, "voice_type":
-                        "azure-realtime-native" if voice in NATIVE_VOICES else "azure-standard"}}
+                    "audio": {"output": {
+                        "voice": voice,
+                        "voice_type": "azure-realtime-native" if voice in NATIVE_VOICES else "azure-standard"
+                    }}
                 })
             async with connect_voice(client, cfg, headers, transport) as upstream:
                 await relay(browser, upstream, transport, on_conversation=announce_conversation)
@@ -1161,6 +1340,7 @@ def create_app(settings=None, token_provider=None):
     app.router.add_get("/api/agent", agent_status)
     app.router.add_get("/api/agent/settings", agent_settings)
     app.router.add_post("/api/agent/model", change_agent_model)
+    app.router.add_post("/api/agent/switch", switch_agent)
     app.router.add_post("/api/conversation/download", download_conversation)
     app.router.add_get("/", asset)
     app.router.add_get("/{file}", asset)
