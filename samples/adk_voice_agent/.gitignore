@@ -1,0 +1,5 @@
+.env
+.env.azure
+.env.gemini
+artifacts/
+__pycache__/
