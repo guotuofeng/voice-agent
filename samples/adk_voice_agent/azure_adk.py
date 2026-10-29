@@ -144,6 +144,8 @@ class AzureLiveConnection(BaseLlmConnection):
         input_config = audio["input"]
         if not input_config.get("turn_detection"):
             raise AzureVoiceError("The saved Azure agent must enable server turn detection")
+        if input_config["turn_detection"].get("create_response") is False:
+            raise AzureVoiceError("The saved Azure agent must enable automatic response creation")
         if input_config["turn_detection"].get("interrupt_response") is False:
             raise AzureVoiceError("The saved Azure agent must enable interruption handling")
         if not input_config.get("transcription"):

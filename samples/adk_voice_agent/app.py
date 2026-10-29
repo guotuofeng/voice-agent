@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import aclosing
+from contextlib import AsyncExitStack, ExitStack, aclosing
 import json
 from pathlib import Path
 import threading
@@ -98,12 +98,11 @@ class AudioDevice:
             raise
 
     def close(self) -> None:
-        for stream in reversed(self.streams):
-            try:
-                stream.stop()
-            finally:
-                stream.close()
-        self.streams.clear()
+        streams, self.streams = self.streams, []
+        with ExitStack() as cleanup:
+            for stream in streams:
+                cleanup.callback(stream.close)
+                cleanup.callback(stream.stop)
 
     async def drain(self) -> None:
         async with asyncio.timeout(31):
@@ -276,9 +275,13 @@ async def run(args) -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        audio.close()
-        await runner.close()
-        await sessions.delete_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+        async with AsyncExitStack() as cleanup:
+            cleanup.push_async_callback(
+                sessions.delete_session, app_name=APP_NAME,
+                user_id=user_id, session_id=session_id,
+            )
+            cleanup.push_async_callback(runner.close)
+            cleanup.callback(audio.close)
 
 
 def main() -> None:

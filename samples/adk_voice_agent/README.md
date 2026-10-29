@@ -191,21 +191,31 @@ Recorded on 2026-10-29, Windows, Python 3.12.16 in the isolated `adk` environmen
 
 | Check | Evidence | Status |
 | --- | --- | --- |
-| Offline adapter/application checks | 18 tests: PCM resampling, SDK audio decoding, transcripts, completion, interruption, playback clearing, service/auth/send errors, unsupported flows, independent connections, correlation, cancellation and cleanup | Passed |
-| Real ADK Runner offline | Two turns through the shared `receive_events()`; outbound sockets and Google client construction forbidden | Passed |
+| Offline adapter/application checks | 25 tests: PCM resampling, SDK audio decoding, transcripts, completion, interruption, playback clearing, service/auth/send errors, unsupported flows, independent connections, correlation, cancellation and cleanup | Passed |
+| Fault-injected cleanup and configuration | Stream stop, audio close and Runner close failures; startup readiness timeout; unexpected disconnect; receive-side service error; disabled automatic responses rejected | Passed offline |
+| Real ADK Runner offline | Two turns through the shared `receive_events()`; separate users, sessions, conversations, audio and transcripts; outbound sockets and Google client construction forbidden | Passed |
 | Azure live multi-turn memory | Synthetic 16-kHz WAV input; 166,800 output samples at 24 kHz; two completions; follow-up correctly recalled "What is 2 plus 2?" | Passed |
 | Azure deliberate live interruption | Warm-up, counting prompt, stop prompt; 355,200 generated samples; replacement response "Hello! Stopping the counting now. What would you like to do next?" completed | Passed |
 | Azure without Gemini | Google credentials removed; Google client constructor patched to fail during the successful real runs | Passed |
 | Live Azure correlation | Distinct ADK/Azure sessions and conversation IDs recorded for separate real runs | Passed |
-| Physical microphone/speaker behavior | Live validation used WAV input and disabled playback | Not verified |
-| Gemini live audio/model ID | Skipped by request; no Google account available for model discovery or live execution | Skipped; unverified |
+| Gemini live audio/model ID | Account discovery returned `gemini-3.8-live`; user-run microphone session recorded input/output transcripts, two completed turns and 897,122 bytes of generated 24-kHz PCM16 audio | Passed basic live conversation |
+| Gemini live multi-turn memory | Same application with synthetic WAV input; two completed turns; correctly recalled that the first question was "What is 2 plus 2?" | Passed |
+| Gemini deliberate live interruption | Warm-up, counting prompt, stop prompt; interruption event recorded; replacement response "Hello!" completed | Passed |
+| Gemini bounded-run shutdown | Both WAV runs completed normally with exit code 0; original interactive run ended with `Disconnected.` and no traceback | Passed bounded runs |
+| Physical speaker playback | Gemini output audio was recorded; actual speaker playback was not independently confirmed | Not verified |
+
+Offline audio is generated in memory; temporary recordings and mocked transports
+need no checked-in WAV files or local live-test artifacts. Fault-injected failures
+verify cleanup attempts without contacting either provider.
 
 The initial Azure handshake returned HTTP 400 because required session inputs
 were omitted. Passing them through the SDK's `structured_inputs` parameter
 resolved it without changing the saved agent. Live tests invoked an existing
 agent with server-managed Toolbox configuration; they did not verify an actual
 tool call or approval workflow. Live audio artifacts remain local and ignored.
-Offline mocks alone are not proof of provider interoperability. Gemini live
-validation is outside this review's agreed verification scope. A successful
-Gemini live run with an account-verified model ID would still be required before
-claiming the complete two-provider acceptance criteria.
+Offline mocks alone are not proof of provider interoperability. The user-run
+Gemini session verifies basic live audio and transcripts with the same
+application source and an account-discovered model ID. Subsequent bounded WAV
+runs verified multi-turn memory, interruption, a completed replacement response
+and normal shutdown. Physical speaker playback remains unverified. These live
+checks do not validate unsupported client tools, approval flows or resumption.

@@ -1,6 +1,7 @@
 """Offline checks; no Azure or Gemini service calls."""
 
 import asyncio
+import argparse
 from contextlib import ExitStack
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 
+import app
 from app import APP_NAME, AudioDevice, EventSink, receive_events
 from azure_adk import AzureLiveConnection, AzureVoiceError, PcmResampler
 from providers import create_model
@@ -57,6 +59,59 @@ class AudioTests(unittest.TestCase):
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_audio_close_attempts_every_stream_after_failure(self):
+        audio = AudioDevice(microphone=False, playback=False)
+        output_stream, input_stream = MagicMock(), MagicMock()
+        audio.streams = [output_stream, input_stream]
+        input_stream.stop.side_effect = RuntimeError("stop failed")
+        with self.assertRaisesRegex(RuntimeError, "stop failed"):
+            audio.close()
+        for stream in (output_stream, input_stream):
+            stream.stop.assert_called_once()
+            stream.close.assert_called_once()
+        self.assertEqual(audio.streams, [])
+
+    async def test_application_cleanup_continues_after_close_failure(self):
+        async def wait_for_cancellation(*args):
+            await asyncio.Event().wait()
+
+        for failure_source in ("audio", "runner"):
+            with self.subTest(failure_source=failure_source), tempfile.TemporaryDirectory() as directory:
+                runner = MagicMock()
+                runner.close = AsyncMock()
+                sessions = MagicMock()
+                sessions.create_session = AsyncMock()
+                sessions.delete_session = AsyncMock()
+                audio = MagicMock()
+                audio.failure = asyncio.get_running_loop().create_future()
+                audio.drain = AsyncMock()
+                getattr(audio if failure_source == "audio" else runner, "close").side_effect = RuntimeError(
+                    "close failed"
+                )
+                args = argparse.Namespace(
+                    wav=[], no_playback=True, output_dir=Path(directory) / "run",
+                    seconds=0.01, turn_timeout=1,
+                )
+                with ExitStack() as patches:
+                    patches.enter_context(patch("app.create_model", return_value="unused-model"))
+                    patches.enter_context(patch("app.Runner", return_value=runner))
+                    patches.enter_context(patch("app.InMemorySessionService", return_value=sessions))
+                    patches.enter_context(patch("app.AudioDevice", return_value=audio))
+                    receive = patches.enter_context(patch(
+                        "app.receive_events", side_effect=wait_for_cancellation,
+                    ))
+                    send = patches.enter_context(patch(
+                        "app.send_microphone", side_effect=wait_for_cancellation,
+                    ))
+                    patches.enter_context(patch("builtins.print"))
+                    with self.assertRaisesRegex(RuntimeError, "close failed"):
+                        await app.run(args)
+                audio.close.assert_called_once()
+                runner.close.assert_awaited_once()
+                sessions.delete_session.assert_awaited_once()
+                receive.assert_awaited_once()
+                send.assert_awaited_once()
+
     async def test_interrupt_clears_playback_and_stale_completion(self):
         audio = AudioDevice(microphone=False, playback=True)
         with tempfile.TemporaryDirectory() as directory:
@@ -168,6 +223,12 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(AzureVoiceError, "function tools"):
             self.connection.configure_audio(session)
 
+    def test_reject_disabled_automatic_responses(self):
+        session = session_event()["session"]
+        session["audio"]["input"]["turn_detection"]["create_response"] = False
+        with self.assertRaisesRegex(AzureVoiceError, "automatic response creation"):
+            self.connection.configure_audio(session)
+
 
 class FakeTransport:
     def __init__(self):
@@ -254,12 +315,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.project.beta.voice_agents.realtime.connect.side_effect = connect
 
-    async def make_runner(self, session_id="adk-one"):
-        model = create_model(session_id=session_id, user_id="user-one")
+    async def make_runner(self, session_id="adk-one", user_id="user-one"):
+        model = create_model(session_id=session_id, user_id=user_id)
         agent = Agent(name="voice_agent", model=model, include_contents="none")
         sessions = InMemorySessionService()
         await sessions.create_session(
-            app_name=APP_NAME, user_id="user-one", session_id=session_id
+            app_name=APP_NAME, user_id=user_id, session_id=session_id
         )
         runner = Runner(agent=agent, app_name=APP_NAME, session_service=sessions)
         return runner
@@ -333,6 +394,113 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertNotEqual(*identifiers)
         self.assertTrue(all(raw.closed for raw in self.transports))
+
+    async def test_distinct_adk_users_keep_audio_and_transcripts_isolated(self):
+        users = [("user-one", "adk-one"), ("user-two", "adk-two")]
+        runners = [await self.make_runner(session_id, user_id) for user_id, session_id in users]
+        queues = [LiveRequestQueue(), LiveRequestQueue()]
+        sinks = [RecordingSink(), RecordingSink()]
+        tasks = []
+        try:
+            for runner, requests, sink, (user_id, session_id) in zip(runners, queues, sinks, users):
+                self.connected.clear()
+                tasks.append(asyncio.create_task(receive_events(
+                    runner, user_id, session_id, requests, sink,
+                )))
+                await asyncio.wait_for(self.connected.wait(), 5)
+                await asyncio.wait_for(self.transports[-1].ready.wait(), 5)
+            for index, (requests, raw) in enumerate(zip(queues, self.transports)):
+                requests.send_realtime(types.Blob(
+                    data=np.full(16000, index * 10000, dtype="<i2").tobytes(),
+                    mime_type="audio/pcm;rate=16000",
+                ))
+                raw.events.put_nowait({
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "conversation_id": f"private-conversation-{index}",
+                    "transcript": f"private transcript {index}",
+                })
+                raw.events.put_nowait(models.RealtimeServerEventResponseAudioDelta(
+                    event_id=f"event-{index}", response_id=f"response-{index}",
+                    item_id=f"item-{index}", output_index=0, content_index=0,
+                    delta=np.full(240, index * 1000, dtype="<i2").tobytes(),
+                ))
+            for index, (sink, (user_id, session_id)) in enumerate(zip(sinks, users)):
+                await sink.wait_for(lambda events: any(event.content for event in events))
+                transcripts = [event for event in sink.events if event.input_transcription]
+                self.assertEqual(len(transcripts), 1)
+                self.assertEqual(transcripts[0].input_transcription.text, f"private transcript {index}")
+                audio_events = [event for event in sink.events if event.content]
+                self.assertEqual(len(audio_events), 1)
+                self.assertEqual(
+                    audio_events[0].content.parts[0].inline_data.data,
+                    np.full(240, index * 1000, dtype="<i2").tobytes(),
+                )
+                metadata = audio_events[0].custom_metadata
+                self.assertEqual(metadata["adk_user_id"], user_id)
+                self.assertEqual(metadata["adk_session_id"], session_id)
+                self.assertEqual(metadata["azure_conversation_id"], f"private-conversation-{index}")
+            for requests in queues:
+                requests.close()
+            await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            first_audio, second_audio = [
+                raw.input_audio_buffer.append.call_args.kwargs["audio"] for raw in self.transports
+            ]
+            self.assertNotEqual(first_audio, second_audio)
+            self.assertTrue(all(raw.closed for raw in self.transports))
+        finally:
+            for requests in queues:
+                requests.close()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*(runner.close() for runner in runners))
+
+    async def test_startup_timeout_closes_resources(self):
+        raw = FakeTransport()
+        while not raw.events.empty():
+            raw.events.get_nowait()
+        model = create_model(session_id="adk-one", user_id="user-one")
+        model.ready_timeout = 0.01
+        with patch(f"{__name__}.FakeTransport", return_value=raw):
+            with self.assertRaises(TimeoutError):
+                async with model.connect(LlmRequest()):
+                    self.fail("A session without readiness events must time out")
+        self.assertTrue(raw.closed)
+        self.credential.__aexit__.assert_awaited_once()
+        self.project.__aexit__.assert_awaited_once()
+
+    async def assert_receive_failure_cleanup(self, event, error_type, message):
+        runner = await self.make_runner()
+        requests = LiveRequestQueue()
+        task = asyncio.create_task(receive_events(
+            runner, "user-one", "adk-one", requests, RecordingSink(),
+        ))
+        try:
+            await asyncio.wait_for(self.connected.wait(), 5)
+            raw = self.transports[0]
+            await asyncio.wait_for(raw.ready.wait(), 5)
+            raw.events.put_nowait(event)
+            with self.assertRaisesRegex(error_type, message):
+                await asyncio.wait_for(task, 5)
+            self.assertTrue(raw.closed)
+            self.credential.__aexit__.assert_awaited_once()
+            self.project.__aexit__.assert_awaited_once()
+        finally:
+            requests.close()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await runner.close()
+
+    async def test_unexpected_disconnect_closes_resources(self):
+        await self.assert_receive_failure_cleanup(
+            ConnectionResetError("remote disconnected"), ConnectionResetError, "remote disconnected",
+        )
+
+    async def test_receive_service_error_closes_resources(self):
+        await self.assert_receive_failure_cleanup(
+            {"type": "error", "error": {"code": "denied", "message": "no access"}},
+            AzureVoiceError, "denied: no access",
+        )
 
     async def test_runner_cancellation_closes_resources(self):
         runner = await self.make_runner()
