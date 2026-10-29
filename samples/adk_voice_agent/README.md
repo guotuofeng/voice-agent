@@ -86,9 +86,10 @@ python providers.py --env-file .env.gemini --list-gemini-models
 
 Set `GEMINI_MODEL` to an audio-capable Live model from that account's results and
 verify it with the application. Model discovery alone does not prove a live
-audio conversation succeeds. Gemini model discovery and live testing were
-skipped by request because no Google account was available. Gemini live support
-and a current model ID remain unverified.
+audio conversation succeeds. Recorded validation used the account-discovered
+`gemini-3.8-live` model for successful audio, memory and interruption checks;
+see Verification below. Availability can change, so discover a model for your
+own account rather than assuming this ID remains available.
 
 ## Run the Identical Application
 
@@ -191,8 +192,9 @@ Recorded on 2026-10-29, Windows, Python 3.12.16 in the isolated `adk` environmen
 
 | Check | Evidence | Status |
 | --- | --- | --- |
-| Offline adapter/application checks | 25 tests: PCM resampling, SDK audio decoding, transcripts, completion, interruption, playback clearing, service/auth/send errors, unsupported flows, independent connections, correlation, cancellation and cleanup | Passed |
-| Fault-injected cleanup and configuration | Stream stop, audio close and Runner close failures; startup readiness timeout; unexpected disconnect; receive-side service error; disabled automatic responses rejected | Passed offline |
+| Offline adapter/application checks | 36 tests: PCM resampling, SDK audio decoding, transcripts, completion, interruption, playback clearing, service/auth/send errors, unsupported flows, independent connections, correlation, cancellation and cleanup | Passed |
+| Fault-injected cleanup and configuration | Stream stop, audio close and Runner close failures; primary send/authentication errors and cancellation preserved through transport, SDK context and client cleanup failures; application provider errors and cancellation preserved through audio, Runner and session cleanup failures, with all cleanup attempted; audio startup errors preserved during stream cleanup; acquired artifact files closed on partial initialization failure; both artifact files attempted on close failures without masking primary errors; cleanup-only failures still propagated; failed/incomplete responses after interruption; startup readiness timeout; unexpected disconnect; receive-side service error; disabled automatic responses rejected | Passed offline |
+| Final playback drain | Provider/sender errors, unexpected disconnect and audio failures propagated during drain; drain timeout and cancellation propagated; normal completion preserved; drain task cleaned up | Passed offline |
 | Real ADK Runner offline | Two turns through the shared `receive_events()`; separate users, sessions, conversations, audio and transcripts; outbound sockets and Google client construction forbidden | Passed |
 | Azure live multi-turn memory | Synthetic 16-kHz WAV input; 166,800 output samples at 24 kHz; two completions; follow-up correctly recalled "What is 2 plus 2?" | Passed |
 | Azure deliberate live interruption | Warm-up, counting prompt, stop prompt; 355,200 generated samples; replacement response "Hello! Stopping the counting now. What would you like to do next?" completed | Passed |

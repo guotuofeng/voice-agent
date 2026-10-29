@@ -79,35 +79,43 @@ class AzureVoiceAgent(BaseLlm):
         if live_config.speech_config is not None:
             raise ValueError("Configure the voice on the saved Azure agent, not RunConfig")
         agent_session_id = uuid4().hex
-        async with AsyncExitStack() as stack:
-            credential = await stack.enter_async_context(DefaultAzureCredential())
-            project = await stack.enter_async_context(
-                AIProjectClient(
-                    endpoint=self.project_endpoint,
-                    credential=credential,
-                    allow_preview=True,
-                )
-            )
-            raw = await stack.enter_async_context(
-                project.beta.voice_agents.realtime.connect(
-                    agent_name=self.agent_name, agent_session_id=agent_session_id,
-                    structured_inputs=self.structured_inputs,
-                )
-            )
-            connection = AzureLiveConnection(
-                raw,
-                {
-                    "provider": "azure",
-                    "adk_session_id": self.adk_session_id,
-                    "adk_user_id": self.adk_user_id,
-                    "azure_agent_session_id": agent_session_id,
-                },
-            )
-            try:
-                await asyncio.wait_for(connection.wait_ready(), self.ready_timeout)
-                yield connection
-            finally:
-                await connection.close()
+        primary_error: BaseException | None = None
+        try:
+            async with AsyncExitStack() as stack:
+                try:
+                    credential = await stack.enter_async_context(DefaultAzureCredential())
+                    project = await stack.enter_async_context(
+                        AIProjectClient(
+                            endpoint=self.project_endpoint,
+                            credential=credential,
+                            allow_preview=True,
+                        )
+                    )
+                    raw = await stack.enter_async_context(
+                        project.beta.voice_agents.realtime.connect(
+                            agent_name=self.agent_name, agent_session_id=agent_session_id,
+                            structured_inputs=self.structured_inputs,
+                        )
+                    )
+                    connection = AzureLiveConnection(
+                        raw,
+                        {
+                            "provider": "azure",
+                            "adk_session_id": self.adk_session_id,
+                            "adk_user_id": self.adk_user_id,
+                            "azure_agent_session_id": agent_session_id,
+                        },
+                    )
+                    stack.push_async_callback(connection.close)
+                    await asyncio.wait_for(connection.wait_ready(), self.ready_timeout)
+                    yield connection
+                except BaseException as error:
+                    primary_error = error
+                    raise
+        except BaseException as cleanup_error:
+            if primary_error is not None and cleanup_error is not primary_error:
+                raise primary_error from cleanup_error
+            raise
 
 
 class AzureLiveConnection(BaseLlmConnection):
@@ -183,7 +191,10 @@ class AzureLiveConnection(BaseLlmConnection):
             await operation()
         except Exception as error:
             self.failure = error
-            await self.raw.close()
+            try:
+                await self.raw.close()
+            except Exception as cleanup_error:
+                raise error from cleanup_error
             raise
 
     async def send_content(self, content: types.Content) -> None:
@@ -287,15 +298,16 @@ class AzureLiveConnection(BaseLlmConnection):
             status = response.get("status")
             if response["id"] == self.active_response_id:
                 self.active_response_id = None
-            if response["id"] in self.interrupted_response_ids:
-                self.interrupted_response_ids.remove(response["id"])
-                return []
-            if status == "cancelled":
-                return [self.response(interrupted=True)]
-            if status != "completed":
+            interrupted = response["id"] in self.interrupted_response_ids
+            self.interrupted_response_ids.discard(response["id"])
+            if status not in ("completed", "cancelled"):
                 raise AzureVoiceError(
                     f"Azure response {status}: {response.get('status_details')}"
                 )
+            if interrupted:
+                return []
+            if status == "cancelled":
+                return [self.response(interrupted=True)]
             return [self.response(turn_complete=True)]
         return []
 

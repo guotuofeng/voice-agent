@@ -93,8 +93,11 @@ class AudioDevice:
                 )
                 self.streams.append(stream)
                 stream.start()
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
             raise
 
     def close(self) -> None:
@@ -123,21 +126,30 @@ class EventSink:
         self.audio_bytes = 0
         self.log = None
         self.recording = None
+        self.cleanup = ExitStack()
 
     def __enter__(self):
-        self.output_dir.mkdir(parents=True, exist_ok=False)
-        self.log = (self.output_dir / "events.jsonl").open("w", encoding="utf-8")
-        self.recording = wave.open(str(self.output_dir / "generated.wav"), "wb")
-        self.recording.setnchannels(1)
-        self.recording.setsampwidth(2)
-        self.recording.setframerate(OUTPUT_RATE)
-        return self
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=False)
+            self.log = (self.output_dir / "events.jsonl").open("w", encoding="utf-8")
+            self.cleanup.callback(self.log.close)
+            self.recording = wave.open(str(self.output_dir / "generated.wav"), "wb")
+            self.cleanup.callback(self.recording.close)
+            self.recording.setnchannels(1)
+            self.recording.setsampwidth(2)
+            self.recording.setframerate(OUTPUT_RATE)
+            return self
+        except BaseException as error:
+            self.__exit__(type(error), error, error.__traceback__)
+            raise
 
-    def __exit__(self, *args):
-        if self.recording:
-            self.recording.close()
-        if self.log:
-            self.log.close()
+    def __exit__(self, exc_type, error, traceback):
+        try:
+            self.cleanup.close()
+        except BaseException as cleanup_error:
+            if error is not None and cleanup_error is not error:
+                raise error from cleanup_error
+            raise
 
     def handle(self, event) -> None:
         record = {
@@ -243,6 +255,7 @@ async def run(args) -> None:
     output_dir = args.output_dir or Path("artifacts") / session_id
     tasks = []
     print(f"ADK session: {session_id}\nArtifacts: {output_dir}", flush=True)
+    primary_error: BaseException | None = None
     try:
         with EventSink(audio, output_dir) as sink:
             audio.start()
@@ -269,19 +282,41 @@ async def run(args) -> None:
                 raise ConnectionError("Live provider disconnected before the application closed")
             if args.wav and sink.audio_bytes == 0:
                 raise RuntimeError("No audio output received")
-            await audio.drain()
+            drain = asyncio.create_task(audio.drain())
+            tasks.append(drain)
+            pending = {*tasks, audio.failure}
+            while True:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if audio.failure in done:
+                    raise RuntimeError(audio.failure.result())
+                for task in done:
+                    task.result()
+                if receive in done and not requests.closed:
+                    raise ConnectionError("Live provider disconnected before the application closed")
+                if drain in done:
+                    break
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        requests.close()
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        async with AsyncExitStack() as cleanup:
-            cleanup.push_async_callback(
-                sessions.delete_session, app_name=APP_NAME,
-                user_id=user_id, session_id=session_id,
-            )
-            cleanup.push_async_callback(runner.close)
-            cleanup.callback(audio.close)
+        try:
+            requests.close()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            async with AsyncExitStack() as cleanup:
+                cleanup.push_async_callback(
+                    sessions.delete_session, app_name=APP_NAME,
+                    user_id=user_id, session_id=session_id,
+                )
+                cleanup.push_async_callback(runner.close)
+                cleanup.callback(audio.close)
+        except BaseException as cleanup_error:
+            if primary_error is not None and cleanup_error is not primary_error:
+                raise primary_error from cleanup_error
+            raise
 
 
 def main() -> None:
