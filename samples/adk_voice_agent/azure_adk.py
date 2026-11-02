@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
+import json
 from typing import AsyncGenerator
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -71,8 +72,12 @@ class AzureVoiceAgent(BaseLlm):
         endpoint = urlsplit(self.project_endpoint)
         if endpoint.scheme != "https" or not endpoint.netloc:
             raise ValueError("AZURE_PROJECT_ENDPOINT must be an HTTPS project endpoint")
-        if llm_request.tools_dict or llm_request.config.tools:
-            raise ValueError("ADK client tools are unsupported; use Azure server-managed tools")
+        tool_names = set(llm_request.tools_dict)
+        for tool in llm_request.config.tools or []:
+            if not tool.function_declarations:
+                raise ValueError("Only ADK function tools are supported")
+            if any(declaration.name not in tool_names for declaration in tool.function_declarations):
+                raise ValueError("Every function declaration needs an ADK executor")
         live_config = llm_request.live_connect_config
         if live_config.session_resumption is not None:
             raise ValueError("Azure session resumption is not supported by this adapter")
@@ -105,6 +110,7 @@ class AzureVoiceAgent(BaseLlm):
                             "adk_user_id": self.adk_user_id,
                             "azure_agent_session_id": agent_session_id,
                         },
+                        tool_names=tool_names,
                     )
                     stack.push_async_callback(connection.close)
                     await asyncio.wait_for(connection.wait_ready(), self.ready_timeout)
@@ -119,7 +125,7 @@ class AzureVoiceAgent(BaseLlm):
 
 
 class AzureLiveConnection(BaseLlmConnection):
-    def __init__(self, raw, correlation: dict[str, str]):
+    def __init__(self, raw, correlation: dict[str, str], *, tool_names: set[str] | None = None):
         self.raw = raw
         self.correlation = dict(correlation)
         self.closed = False
@@ -129,6 +135,9 @@ class AzureLiveConnection(BaseLlmConnection):
         self.output_resampler: PcmResampler | None = None
         self.active_response_id: str | None = None
         self.interrupted_response_ids: set[str] = set()
+        self.tool_names = set(tool_names or ())
+        self.function_calls: dict[str, list[types.Part]] = {}
+        self.pending_calls: dict[str, str] = {}
 
     def response(self, **kwargs) -> LlmResponse:
         return LlmResponse(custom_metadata=dict(self.correlation), **kwargs)
@@ -158,9 +167,19 @@ class AzureLiveConnection(BaseLlmConnection):
             raise AzureVoiceError("The saved Azure agent must enable interruption handling")
         if not input_config.get("transcription"):
             raise AzureVoiceError("The saved Azure agent must enable input transcription")
-        for tool in session.get("tools") or []:
-            if tool.get("type") == "function":
-                raise AzureVoiceError("Azure client function tools are unsupported")
+        saved_functions = {
+            tool["name"] for tool in session.get("tools") or []
+            if tool.get("type") == "function"
+        }
+        if saved_functions != self.tool_names:
+            raise AzureVoiceError(
+                "Saved Azure function tools must match ADK function tools: "
+                f"saved={sorted(saved_functions)}, ADK={sorted(self.tool_names)}. "
+                "For the registered function tools, preview setup with: python providers.py "
+                "--env-file <your-env-file> --configure-azure-tools; "
+                "then rerun setup with --apply to create a new saved agent version. "
+                "Or omit --enable-tools to use an agent without client functions."
+            )
         if self.input_resampler is None:
             self.input_resampler = PcmResampler(INPUT_RATE, rates[0])
             self.output_resampler = PcmResampler(rates[1], OUTPUT_RATE)
@@ -203,10 +222,13 @@ class AzureLiveConnection(BaseLlmConnection):
     async def send_text(self, content: types.Content, *, partial: bool = False) -> None:
         if partial:
             raise ValueError("Partial text turns are unsupported")
+        if content.parts and all(part.function_response for part in content.parts):
+            await self.send_tool_results(content)
+            return
         if content.role not in (None, "user") or not content.parts:
             raise ValueError("Only nonempty user text content is supported")
         if any(part.text is None for part in content.parts):
-            raise ValueError("Client tool results and non-text content are unsupported")
+            raise ValueError("Mixed tool results and non-text content are unsupported")
         await self.raw.send(
                 {
                     "type": "conversation.item.create",
@@ -221,6 +243,25 @@ class AzureLiveConnection(BaseLlmConnection):
                 }
         )
         await self.raw.send({"type": "response.create"})
+
+    async def send_tool_results(self, content: types.Content) -> None:
+        results = [part.function_response for part in content.parts]
+        result_ids = [result.id for result in results]
+        if len(set(result_ids)) != len(result_ids) or any(
+            not result.id or self.pending_calls.get(result.id) != result.name
+            for result in results
+        ):
+            raise ValueError("Tool results must match pending function call IDs and names")
+        outputs = [
+            {"type": "function_call_output", "call_id": result.id,
+             "output": json.dumps(result.response, allow_nan=False)}
+            for result in results
+        ]
+        for output in outputs:
+            await self.raw.send({"type": "conversation.item.create", "item": output})
+            del self.pending_calls[output["call_id"]]
+        if not self.pending_calls:
+            await self.raw.send({"type": "response.create"})
 
     async def _send_content(self, content: types.Content, *, partial: bool = False):
         await self.send_operation(lambda: self.send_text(content, partial=partial))
@@ -289,12 +330,31 @@ class AzureLiveConnection(BaseLlmConnection):
             ))]
         if event_type == "response.output_item.added":
             item_type = (payload.get("item") or {}).get("type", "")
-            if item_type in {"function_call", "mcp_approval_request"}:
+            if item_type == "mcp_approval_request":
                 raise AzureVoiceError(f"Unsupported client execution/approval flow: {item_type}")
         if event_type == "response.function_call_arguments.done":
-            raise AzureVoiceError("Azure requested unsupported client function execution")
+            name, call_id = payload.get("name"), payload.get("call_id")
+            if name not in self.tool_names or not call_id or not response_id:
+                raise AzureVoiceError("Unknown function or missing function call identity")
+            try:
+                arguments = json.loads(payload["arguments"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise AzureVoiceError("Invalid function call arguments") from error
+            if not isinstance(arguments, dict):
+                raise AzureVoiceError("Function call arguments must be a JSON object")
+            calls = self.function_calls.setdefault(response_id, [])
+            if call_id in self.pending_calls or any(
+                part.function_call.id == call_id
+                for parts in self.function_calls.values() for part in parts
+            ):
+                raise AzureVoiceError("Duplicate function call ID")
+            calls.append(types.Part(function_call=types.FunctionCall(
+                id=call_id, name=name, args=arguments,
+            )))
+            return []
         if event_type == "response.done":
             response = payload["response"]
+            calls = self.function_calls.pop(response["id"], [])
             status = response.get("status")
             if response["id"] == self.active_response_id:
                 self.active_response_id = None
@@ -308,6 +368,9 @@ class AzureLiveConnection(BaseLlmConnection):
                 return []
             if status == "cancelled":
                 return [self.response(interrupted=True)]
+            if calls:
+                self.pending_calls.update({part.function_call.id: part.function_call.name for part in calls})
+                return [self.response(content=types.Content(role="model", parts=calls))]
             return [self.response(turn_complete=True)]
         return []
 

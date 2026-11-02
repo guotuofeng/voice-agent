@@ -20,6 +20,7 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from providers import create_model
+from tool_support import get_tools
 
 INPUT_RATE = 16000
 OUTPUT_RATE = 24000
@@ -180,6 +181,11 @@ class EventSink:
                 elif part.text:
                     record["text"] = part.text
                     print(part.text, end="", flush=True)
+                elif part.function_call or part.function_response:
+                    field = "function_call" if part.function_call else "function_response"
+                    payload = getattr(part, field).model_dump(exclude_none=True)
+                    record.setdefault(field, []).append(payload)
+                    print(f"\n[{field}] {json.dumps(payload)}", flush=True)
         for field in ("input_transcription", "output_transcription"):
             transcript = getattr(event, field)
             if transcript and transcript.text:
@@ -247,6 +253,7 @@ async def run(args) -> None:
         name="voice_agent",
         model=create_model(session_id=session_id, user_id=user_id),
         include_contents="none",
+        tools=get_tools() if getattr(args, "enable_tools", False) else [],
     )
     runner = Runner(agent=agent, app_name=APP_NAME, session_service=sessions)
     await sessions.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
@@ -325,6 +332,7 @@ def main() -> None:
     parser.add_argument("--wav", type=Path, action="append", default=[])
     parser.add_argument("--no-playback", action="store_true")
     parser.add_argument("--barge-in", action="store_true")
+    parser.add_argument("--enable-tools", action="store_true")
     parser.add_argument("--seconds", type=float, default=None)
     parser.add_argument("--turn-timeout", type=float, default=60)
     parser.add_argument("--output-dir", type=Path)

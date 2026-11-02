@@ -1,10 +1,47 @@
 """Provider selection is confined to this integration/configuration module."""
 
 import argparse
+import asyncio
 import json
 import os
 
 from google.adk.models.base_llm import BaseLlm
+
+from tool_support import get_function_declarations, with_demo_tool
+
+
+async def configure_azure_tools(*, apply: bool = False) -> None:
+    from azure.ai.projects import models
+    from azure.ai.projects.aio import AIProjectClient
+    from azure.identity.aio import DefaultAzureCredential
+
+    if required("VOICE_PROVIDER").lower() != "azure":
+        raise ValueError("Select an Azure environment file for --configure-azure-tools")
+    agent_name = required("AZURE_VOICE_AGENT_NAME")
+    async with DefaultAzureCredential() as credential, AIProjectClient(
+        endpoint=required("AZURE_PROJECT_ENDPOINT"), credential=credential, allow_preview=True,
+    ) as project:
+        latest = (await project.agents.get(agent_name)).versions.latest
+        original = latest.definition.as_dict()
+        updated = with_demo_tool(original)
+        names = ", ".join(tool["name"] for tool in get_function_declarations())
+        if original == updated:
+            print(f"Agent {agent_name} version {latest.version} already declares {names}.")
+            return
+        print(f"Agent: {agent_name}; base version: {latest.version}")
+        print(f"Configure functions: {names}")
+        print("Preserve existing instructions, model, voice, audio, and server-managed tools.")
+        if not apply:
+            print("Preview only. Rerun with --apply to create a new latest agent version.")
+            return
+        current = (await project.agents.get(agent_name)).versions.latest
+        if current.version != latest.version:
+            raise RuntimeError("The latest agent version changed; rerun setup to review it")
+        created = await project.agents.create_version(
+            agent_name, definition=models.VoiceAgentDefinition(updated),
+            metadata=latest.metadata, description=latest.description,
+        )
+        print(f"Created agent {agent_name} version {created.version}. Run app.py with --enable-tools.")
 
 
 def required(name: str) -> str:
@@ -52,7 +89,15 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", required=True)
-    parser.add_argument("--list-gemini-models", action="store_true", required=True)
+    commands = parser.add_mutually_exclusive_group(required=True)
+    commands.add_argument("--list-gemini-models", action="store_true")
+    commands.add_argument("--configure-azure-tools", action="store_true")
+    parser.add_argument("--apply", action="store_true")
     arguments = parser.parse_args()
+    if arguments.apply and not arguments.configure_azure_tools:
+        parser.error("--apply requires --configure-azure-tools")
     load_dotenv(arguments.env_file, override=True)
-    list_gemini_models()
+    if arguments.configure_azure_tools:
+        asyncio.run(configure_azure_tools(apply=arguments.apply))
+    else:
+        list_gemini_models()

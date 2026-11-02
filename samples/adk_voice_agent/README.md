@@ -23,15 +23,17 @@ client, need a Gemini key/model, or call Google services.
 - The saved Azure agent must use the realtime voice protocol (not GPT Live's
   `sub_protocol: live`), mono PCM16 at 24 kHz in both directions, input
   transcription, automatic response creation, and server VAD with interruption
-  enabled. Only server-managed tools are supported.
+  enabled. For optional local function execution, declare the matching function
+  on the saved agent as described below.
 - For Gemini, a Google API key with access to a Live audio model. Discover a
   model available to your account as described below; do not assume an old
   preview model is still available.
 
 The adapter never creates or versions an Azure agent and never sends
 `session.update`. Instructions, model, voice, VAD, and tool configuration remain
-owned by the saved resource. Do not copy Azure instructions/tools into the ADK
-`Agent`. The shared application uses `include_contents="none"`; conversational
+owned by the saved resource. Do not copy Azure instructions or server-managed
+tools into the ADK `Agent`. Opt-in local functions have matching declarations
+in ADK and on the saved Azure agent. The shared application uses `include_contents="none"`; conversational
 state remains in the live provider session, not replayed ADK history.
 
 ## Install in an Isolated Environment
@@ -126,6 +128,112 @@ The saved agent controls its responses, including greetings. WAV mode assumes
 one input utterance per file; avoid files with several VAD-separated utterances
 or unrelated autonomous responses. Check the transcripts, not just turn counts.
 
+## Run a Local Function Tool
+
+Enable the same ADK `add_numbers(first_number, second_number)` function for either
+provider. It runs locally, returns a JSON sum, and needs no external API or secret.
+Without `--enable-tools`, the existing no-client-tools behavior is unchanged.
+
+Shared tool implementations and registration live in
+[tool_support.py](tool_support.py). To add a function, define its callable there
+and add its callable/description/JSON-schema pair to `FUNCTION_TOOLS`. The app
+uses `get_tools()` for either provider, and Azure setup uses the same registry
+to build saved function declarations. No per-tool edits to the app, provider
+selection, or protocol adapter are needed. ADK derives its schema from the
+callable, so keep its signature and the registered JSON schema compatible.
+After adding a tool, rerun Azure setup preview/apply before enabling it against
+the saved agent. MCP execution is not added by this refactor; existing saved
+Azure MCP/Toolbox tools remain service-managed.
+
+For Azure, `--enable-tools` alone cannot register the function on the saved agent.
+If startup reports `saved=[], ADK=['add_numbers']`, the Azure agent is missing
+the declaration. The ADK experimental-schema warning is not the cause.
+
+Run the setup preview using the same environment file as the application:
+
+```powershell
+python providers.py --env-file .env --configure-azure-tools
+```
+
+The preview reads the existing agent but does not modify it. After reviewing the
+agent name and base version, explicitly apply the addition:
+
+```powershell
+python providers.py --env-file .env --configure-azure-tools --apply
+python app.py --env-file .env --enable-tools
+```
+
+Use `.env.azure` instead of `.env` if that is your selected Azure file. Applying
+creates a **new latest version of the configured Azure agent**, so other callers
+of that agent may also receive local function calls. Prefer a dedicated demo
+agent. The helper preserves the existing definition, including instructions,
+model, voice, and server-managed tools, plus version metadata and description.
+It does not overwrite a conflicting function schema or remove other client
+functions, and skips version creation if the matching declaration already exists.
+It requires agent-write permission; normal application invocation does not.
+
+Alternatively, configure the saved `tools` yourself with this declaration:
+
+```json
+{
+  "type": "function",
+  "name": "add_numbers",
+  "description": "Add two numbers using the client application.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "first_number": {"type": "number"},
+      "second_number": {"type": "number"}
+    },
+    "required": ["first_number", "second_number"],
+    "additionalProperties": false
+  }
+}
+```
+
+Keep its existing MCP/Toolbox tools and audio configuration. The agent's saved
+instructions must allow it to use `add_numbers`; for a reliable demo, ask it to
+use that function for addition. The adapter does not modify or create the agent,
+override its instructions, or register tools using `session.update`. See the
+[local function sample](../voice_agent_with_local_function.py) for the SDK's
+`VoiceAgentFunctionTool` declaration pattern. The sample above uses different
+argument names from that standalone example; use this declaration with ADK.
+
+```powershell
+python app.py --env-file .env.azure --enable-tools --seconds 60
+python app.py --env-file .env.gemini --enable-tools --seconds 60
+```
+
+Say: "Use the add_numbers tool to add twelve and thirty." Expect a
+`[function_call]`, a local `[function_response]` containing `{"sum": 42}`, and a
+spoken answer. The same flag works with `--wav` and `--no-playback`. For Gemini,
+native ADK registers the function declaration; no Azure configuration is used.
+
+### Tool Ownership
+
+| Tool kind | Declaration/configuration | Execution owner |
+| --- | --- | --- |
+| Azure MCP/Toolbox | Existing saved Azure agent | Azure service; not copied to or executed by ADK |
+| Local function, Azure | Saved Azure function declaration plus matching ADK function | ADK client process; adapter translates calls and results only |
+| Local function, Gemini | Same ADK function | Native ADK live integration and client executor |
+
+On Azure, saved function names must exactly match the locally registered ADK
+functions, with compatible argument schemas. Missing or extra functions fail
+at startup instead of leaving calls unanswered. Calls are buffered until Azure's
+response completes, then sent to ADK as a batch. All correlated function results
+are submitted before one continuation request; the intermediate function response
+does not complete the user's voice turn. Unknown functions, invalid JSON arguments,
+and mismatched/duplicate result IDs fail explicitly. Calls interrupted before
+dispatch are discarded. Already-running local operations cannot be undone by
+barge-in; keep functions short and read-only, and use asynchronous functions for
+I/O so they do not block streaming audio.
+
+MCP approval requests, ADK tool-confirmation/approval callbacks, long-running tool
+workflows, and provider-specific built-in tools are outside this adapter contract.
+Do not expose side-effecting tools that need approval through this sample.
+Spoken filler before tool calls remains controlled by each provider and the saved
+agent instructions; the adapter does not synthesize filler or promise equal latency.
+
 ## Provider Contract
 
 | Area | Native ADK Gemini Live | Foundry Voice Agent adapter |
@@ -136,7 +244,7 @@ or unrelated autonomous responses. Check the transcripts, not just turn counts.
 | Application output | Mono PCM16, `audio/pcm;rate=24000` | Same; SDK-decoded audio bytes normalized into ADK blobs |
 | Events | Native ADK live responses | Final input/output transcripts, partial audio/text, interruption, turn completion translated into ADK responses |
 | Interruption | Gemini live signaling clears local playback | Saved server VAD interrupts generation; adapter clears playback and drops late cancelled-response chunks |
-| Tools | ADK client tools supported by native integration | Only Azure server-managed tools; no duplicate ADK tool loop |
+| Tools | ADK client functions registered by native integration | Existing server-managed tools remain in Azure; matching saved functions execute through ADK with `--enable-tools` |
 | Authentication | Google API key in this sample | Server-side `DefaultAzureCredential` |
 | Sessions | Native Gemini live session semantics | Fresh Azure agent session per connection; ADK/Azure IDs attached to response metadata |
 | Reconnect/resume | Native Gemini capabilities outside this sample | No resumption handle, history replay, or automatic reconnect |
@@ -151,10 +259,11 @@ or unrelated autonomous responses. Check the transcripts, not just turn counts.
   disconnects, failed/incomplete responses, and unsupported client execution
   flows raise errors. Cancellation closes the SDK socket, project client, and
   credential; the application closes audio devices and its local ADK session.
-- Server-managed MCP/Toolbox execution remains in Azure. Client function tools,
-  ADK tool results, approval callbacks, manual activity markers, partial text
-  turns, and `audio_stream_end` are not implemented. Do not attach ADK tools or
-  request session resumption/voice overrides in `RunConfig` on the Azure path.
+- Server-managed MCP/Toolbox execution remains in Azure. Local function calls and
+  ADK function results are translated by the adapter; it has no separate executor.
+  Approval callbacks, manual activity markers, partial text turns, and
+  `audio_stream_end` are not implemented. Do not request session resumption/voice
+  overrides in `RunConfig` on the Azure path.
 - Barge-in clears queued playback; it cannot retract samples already played.
   The adapter does not send conversation truncation commands. Authoritative
   history truncation follows the saved agent's `auto_truncate` policy.
@@ -174,10 +283,14 @@ including those later discarded from playback after interruption, so it is not
 an exact recording of what a listener heard.
 
 Transcripts, correlation IDs, and generated speech may contain sensitive data.
+With tools enabled, `events.jsonl` and the console also include function names,
+call IDs, arguments, and results. Do not send secrets to tools or log sensitive
+tool data without adding an appropriate redaction policy.
 Keep artifacts private and delete the printed run directory when no longer
 needed. Credentials and recordings are not checked in. Local cleanup does not
 remove Azure/Google service-side data; retention follows provider and saved
-agent policy. No cloud resource is created by this sample. Remove the isolated
+agent policy. Normal voice runs create no agent resources; the optional setup
+command with `--apply` creates a saved agent version. Remove the isolated
 Conda environment when finished if it is no longer needed.
 
 ## Verification
@@ -210,6 +323,16 @@ Offline audio is generated in memory; temporary recordings and mocked transports
 need no checked-in WAV files or local live-test artifacts. Fault-injected failures
 verify cleanup attempts without contacting either provider.
 
+The tool enhancement has offline coverage for saved-function matching alongside
+server-managed tools, argument/call identity validation, parallel result batching,
+interrupted calls, and a real ADK Runner executing `add_numbers` against a mocked
+Azure transport. Setup tests cover preview-only behavior, configuration
+preservation, idempotency, and conflicting definitions. These checks do not
+contact Google or Azure. The setup preview was also verified against an existing
+Azure agent without applying a change. Live tool execution
+and spoken tool-result playback have not been verified for either provider; the
+2026-10-29 evidence above predates this enhancement.
+
 The initial Azure handshake returned HTTP 400 because required session inputs
 were omitted. Passing them through the SDK's `structured_inputs` parameter
 resolved it without changing the saved agent. Live tests invoked an existing
@@ -220,4 +343,4 @@ Gemini session verifies basic live audio and transcripts with the same
 application source and an account-discovered model ID. Subsequent bounded WAV
 runs verified multi-turn memory, interruption, a completed replacement response
 and normal shutdown. Physical speaker playback remains unverified. These live
-checks do not validate unsupported client tools, approval flows or resumption.
+checks do not validate local function tools, approval flows or resumption.

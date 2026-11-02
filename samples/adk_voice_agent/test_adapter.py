@@ -3,6 +3,7 @@
 import asyncio
 import argparse
 from contextlib import ExitStack
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -19,6 +20,8 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 
 import app
+import providers
+import tool_support
 from app import APP_NAME, AudioDevice, EventSink, receive_events
 from azure_adk import AzureLiveConnection, AzureVoiceError, PcmResampler
 from providers import create_model
@@ -56,6 +59,133 @@ class AudioTests(unittest.TestCase):
     def test_reject_partial_pcm_sample(self):
         with self.assertRaises(ValueError):
             PcmResampler(16000, 24000).convert(b"x")
+
+
+class ToolSetupTests(unittest.IsolatedAsyncioTestCase):
+    def test_shared_registry_drives_execution_and_saved_declarations(self):
+        self.assertEqual(tool_support.get_tools(), [tool_support.add_numbers])
+        self.assertEqual(tool_support.get_tools()[0](12, 30), {"sum": 42})
+        declarations = tool_support.get_function_declarations()
+        self.assertEqual(declarations[0]["name"], tool_support.get_tools()[0].__name__)
+        declarations[0]["parameters"]["properties"].clear()
+        self.assertIn("first_number", tool_support.get_function_declarations()[0]["parameters"]["properties"])
+
+    def test_second_tool_only_requires_shared_registry_change(self):
+        def multiply_numbers(first_number: float, second_number: float) -> dict:
+            return {"product": first_number * second_number}
+
+        declaration = tool_support.get_function_declarations()[0]
+        extra = (multiply_numbers, {
+            "description": "Multiply two numbers.", "parameters": declaration["parameters"],
+        })
+        with patch.object(tool_support, "FUNCTION_TOOLS", (*tool_support.FUNCTION_TOOLS, extra)):
+            self.assertEqual(tool_support.get_tools(), [tool_support.add_numbers, multiply_numbers])
+            updated = providers.with_demo_tool(self.definition())
+            self.assertEqual([tool["name"] for tool in updated["tools"][1:]],
+                             ["add_numbers", "multiply_numbers"])
+            self.assertEqual(providers.with_demo_tool(updated), updated)
+            self.assertEqual(models.VoiceAgentDefinition(updated).as_dict(), updated)
+
+    def definition(self):
+        return {
+            "kind": "voice", "sub_protocol": "realtime", "model": "saved-model",
+            "instructions": "Keep these instructions", "audio": {"output": {"voice": "saved-voice"}},
+            "tools": [{"type": "mcp", "server_label": "existing"}],
+            "custom_field": {"preserve": True},
+        }
+
+    def test_setup_only_adds_function_and_is_idempotent(self):
+        original = self.definition()
+        updated = providers.with_demo_tool(original)
+        self.assertEqual(len(original["tools"]), 1)
+        for field in original:
+            if field != "tools":
+                self.assertEqual(updated[field], original[field])
+        self.assertEqual(updated["tools"][:-1], original["tools"])
+        self.assertEqual(updated["tools"][-1]["name"], "add_numbers")
+        self.assertEqual(providers.with_demo_tool(updated), updated)
+        self.assertEqual(models.VoiceAgentDefinition(updated).as_dict(), updated)
+
+    def test_setup_accepts_omitted_protocol_without_adding_it(self):
+        definition = self.definition()
+        del definition["sub_protocol"]
+        updated = providers.with_demo_tool(definition)
+        self.assertNotIn("sub_protocol", updated)
+        updated["tools"].append({"type": "function", "name": "other"})
+        with self.assertRaisesRegex(ValueError, "other client functions"):
+            providers.with_demo_tool(updated)
+
+    def test_setup_rejects_conflicting_tools_and_nonrealtime_agents(self):
+        for tool in (
+            {"type": "function", "name": "other"},
+            {"type": "function", "name": "add_numbers", "parameters": {}},
+        ):
+            definition = self.definition()
+            definition["tools"].append(tool)
+            with self.assertRaises(ValueError):
+                providers.with_demo_tool(definition)
+        definition["sub_protocol"] = "live"
+        with self.assertRaisesRegex(ValueError, "realtime"):
+            providers.with_demo_tool(definition)
+
+    async def test_setup_preview_never_writes_and_apply_preserves_definition(self):
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                latest = MagicMock(version="7", metadata={"owner": "existing"}, description="original")
+                latest.definition.as_dict.return_value = self.definition()
+                project, credential = MagicMock(), MagicMock()
+                project.__aenter__ = AsyncMock(return_value=project)
+                credential.__aenter__ = AsyncMock(return_value=credential)
+                project.__aexit__ = credential.__aexit__ = AsyncMock(return_value=False)
+                project.agents.get = AsyncMock(return_value=MagicMock(versions=MagicMock(latest=latest)))
+                project.agents.create_version = AsyncMock(return_value=MagicMock(version="8"))
+                with patch.dict(os.environ, {
+                    "VOICE_PROVIDER": "azure", "AZURE_VOICE_AGENT_NAME": "demo",
+                    "AZURE_PROJECT_ENDPOINT": "https://example.test/api/projects/demo",
+                }), patch("azure.identity.aio.DefaultAzureCredential", return_value=credential), patch(
+                    "azure.ai.projects.aio.AIProjectClient", return_value=project,
+                ), patch("builtins.print"):
+                    await providers.configure_azure_tools(apply=apply)
+                if apply:
+                    project.agents.create_version.assert_awaited_once()
+                    arguments = project.agents.create_version.call_args
+                    self.assertEqual(arguments.args, ("demo",))
+                    self.assertEqual(arguments.kwargs["definition"].as_dict(),
+                                     providers.with_demo_tool(self.definition()))
+                    self.assertEqual(arguments.kwargs["metadata"], latest.metadata)
+                    self.assertEqual(arguments.kwargs["description"], "original")
+                else:
+                    project.agents.create_version.assert_not_awaited()
+
+    async def test_setup_skips_existing_function_and_rejects_changed_base_version(self):
+        for already_configured in (False, True):
+            with self.subTest(already_configured=already_configured):
+                original = self.definition()
+                if already_configured:
+                    original = providers.with_demo_tool(original)
+                latest = MagicMock(version="7")
+                latest.definition.as_dict.return_value = original
+                project, credential = MagicMock(), MagicMock()
+                project.__aenter__ = AsyncMock(return_value=project)
+                credential.__aenter__ = AsyncMock(return_value=credential)
+                project.__aexit__ = credential.__aexit__ = AsyncMock(return_value=False)
+                project.agents.get = AsyncMock(side_effect=[
+                    MagicMock(versions=MagicMock(latest=latest)),
+                    MagicMock(versions=MagicMock(latest=MagicMock(version="8"))),
+                ])
+                project.agents.create_version = AsyncMock()
+                with patch.dict(os.environ, {
+                    "VOICE_PROVIDER": "azure", "AZURE_VOICE_AGENT_NAME": "demo",
+                    "AZURE_PROJECT_ENDPOINT": "https://example.test/api/projects/demo",
+                }), patch("azure.identity.aio.DefaultAzureCredential", return_value=credential), patch(
+                    "azure.ai.projects.aio.AIProjectClient", return_value=project,
+                ), patch("builtins.print"):
+                    if already_configured:
+                        await providers.configure_azure_tools(apply=True)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "version changed"):
+                            await providers.configure_azure_tools(apply=True)
+                project.agents.create_version.assert_not_awaited()
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
@@ -335,6 +465,114 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.connection = AzureLiveConnection(self.raw, {"adk_session_id": "adk-one"})
         self.connection.configure_audio(session_event()["session"])
 
+    def function_call(self, call_id="call-one", response_id="r1", **overrides):
+        return {
+            "type": "response.function_call_arguments.done",
+            "response_id": response_id, "call_id": call_id, "name": "add_numbers",
+            "arguments": '{"first_number": 2, "second_number": 3}', **overrides,
+        }
+
+    def complete_tool_response(self):
+        return self.connection.translate({
+            "type": "response.done", "response": {"id": "r1", "status": "completed"},
+        })
+
+    async def test_parallel_function_results_resume_once_after_response_done(self):
+        self.connection.tool_names = {"add_numbers"}
+        for call_id in ("call-one", "call-two"):
+            self.assertEqual(self.connection.translate(self.function_call(call_id)), [])
+        self.raw.send.assert_not_awaited()
+        response = self.complete_tool_response()[0]
+        self.assertFalse(response.turn_complete)
+        self.assertEqual([part.function_call.id for part in response.content.parts], ["call-one", "call-two"])
+        for call_id in ("call-one", "call-two"):
+            await self.connection.send_content(types.Content(role="tool", parts=[
+                types.Part(function_response=types.FunctionResponse(
+                    id=call_id, name="add_numbers", response={"sum": 5},
+                )),
+            ]))
+            self.assertEqual(
+                sum(call.args[0]["type"] == "response.create" for call in self.raw.send.call_args_list),
+                int(call_id == "call-two"),
+            )
+        output = self.raw.send.call_args_list[0].args[0]["item"]
+        self.assertEqual(output["call_id"], "call-one")
+        self.assertEqual(json.loads(output["output"]), {"sum": 5})
+        self.assertEqual(self.connection.pending_calls, {})
+
+    def test_function_call_identity_and_arguments_are_validated(self):
+        self.connection.tool_names = {"add_numbers"}
+        for overrides in (
+            {"name": "unknown"}, {"call_id": ""}, {"response_id": None},
+            {"arguments": "not json"}, {"arguments": "[]"}, {"arguments": "null"},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(AzureVoiceError):
+                self.connection.translate(self.function_call(**overrides))
+        self.connection.translate(self.function_call())
+        with self.assertRaisesRegex(AzureVoiceError, "Duplicate"):
+            self.connection.translate(self.function_call())
+
+    def test_interrupted_or_cancelled_calls_are_not_executed(self):
+        self.connection.tool_names = {"add_numbers"}
+        for status in ("completed", "cancelled"):
+            self.connection.translate({"type": "response.created", "response": {"id": "r1"}})
+            self.connection.translate(self.function_call())
+            self.connection.translate({"type": "input_audio_buffer.speech_started"})
+            self.assertEqual(self.connection.translate({
+                "type": "response.done", "response": {"id": "r1", "status": status},
+            }), [])
+            self.assertEqual(self.connection.pending_calls, {})
+            self.assertEqual(self.connection.function_calls, {})
+
+    async def test_unknown_mismatched_and_duplicate_results_send_nothing(self):
+        self.connection.pending_calls = {"call-one": "add_numbers"}
+        for call_id, name, duplicate in (
+            ("unknown", "add_numbers", False), ("call-one", "other", False),
+            ("call-one", "add_numbers", True),
+        ):
+            part = types.Part(function_response=types.FunctionResponse(
+                id=call_id, name=name, response={"sum": 5},
+            ))
+            with self.subTest(call_id=call_id, name=name, duplicate=duplicate):
+                with self.assertRaisesRegex(ValueError, "pending function"):
+                    await self.connection.send_content(types.Content(
+                        role="tool", parts=[part, part] if duplicate else [part],
+                    ))
+        self.raw.send.assert_not_awaited()
+
+    def test_saved_function_registration_preserves_server_tools(self):
+        self.connection.tool_names = {"add_numbers"}
+        session = session_event()["session"]
+        session["tools"] = [{"type": "mcp", "server_label": "existing"},
+                            {"type": "function", "name": "add_numbers"}]
+        self.connection.configure_audio(session)
+        self.raw.send.assert_not_awaited()
+        session["tools"] = [{"type": "mcp", "server_label": "existing"}]
+        with self.assertRaisesRegex(AzureVoiceError, "must match"):
+            self.connection.configure_audio(session)
+
+    async def test_batched_results_and_tool_send_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                raw = AsyncMock()
+                connection = AzureLiveConnection(raw, {}, tool_names={"add_numbers"})
+                connection.pending_calls = {"one": "add_numbers", "two": "add_numbers"}
+                content = types.Content(role="tool", parts=[
+                    types.Part(function_response=types.FunctionResponse(
+                        id=call_id, name="add_numbers", response={"sum": 5},
+                    )) for call_id in ("one", "two")
+                ])
+                if fail:
+                    raw.send.side_effect = ConnectionError("tool output send failed")
+                    with self.assertRaisesRegex(ConnectionError, "tool output"):
+                        await connection.send_content(content)
+                    raw.close.assert_awaited_once()
+                else:
+                    await connection.send_content(content)
+                    self.assertEqual([call.args[0]["type"] for call in raw.send.call_args_list], [
+                        "conversation.item.create", "conversation.item.create", "response.create",
+                    ])
+
     async def test_partial_text_rejection_closes_receiver(self):
         with self.assertRaisesRegex(ValueError, "Partial text"):
             await self.connection._send_content(
@@ -469,7 +707,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeTransport:
-    def __init__(self):
+    def __init__(self, tools=None):
         self.events = asyncio.Queue()
         self.sent = []
         self.closed = False
@@ -477,7 +715,9 @@ class FakeTransport:
         self.input_audio_buffer = MagicMock()
         self.input_audio_buffer.append = AsyncMock()
         self.events.put_nowait(session_event("session.created"))
-        self.events.put_nowait(session_event())
+        updated = session_event()
+        updated["session"]["tools"] = tools or []
+        self.events.put_nowait(updated)
 
     async def recv(self):
         event = await self.events.get()
@@ -541,9 +781,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.transports = []
         self.connected = asyncio.Event()
+        self.saved_tools = []
 
         def connect(**kwargs):
-            raw = FakeTransport()
+            raw = FakeTransport(self.saved_tools)
             self.transports.append(raw)
             self.connected.set()
             manager = MagicMock()
@@ -616,15 +857,56 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.project.__aexit__.assert_awaited_once()
         self.credential.__aexit__.assert_awaited_once()
 
-    async def make_runner(self, session_id="adk-one", user_id="user-one"):
+    async def make_runner(self, session_id="adk-one", user_id="user-one", *, tools=None):
         model = create_model(session_id=session_id, user_id=user_id)
-        agent = Agent(name="voice_agent", model=model, include_contents="none")
+        agent = Agent(name="voice_agent", model=model, include_contents="none", tools=tools or [])
         sessions = InMemorySessionService()
         await sessions.create_session(
             app_name=APP_NAME, user_id=user_id, session_id=session_id
         )
         runner = Runner(agent=agent, app_name=APP_NAME, session_service=sessions)
         return runner
+
+    async def test_adk_executes_function_and_returns_result_to_azure(self):
+        self.saved_tools = [{"type": "function", "name": "add_numbers"},
+                            {"type": "mcp", "server_label": "existing"}]
+        runner = await self.make_runner(tools=tool_support.get_tools())
+        requests, sink = LiveRequestQueue(), RecordingSink()
+        task = asyncio.create_task(receive_events(
+            runner, "user-one", "adk-one", requests, sink,
+        ))
+        try:
+            await asyncio.wait_for(self.connected.wait(), 5)
+            raw = self.transports[0]
+            await asyncio.wait_for(raw.ready.wait(), 5)
+            raw.events.put_nowait({
+                "type": "response.function_call_arguments.done", "response_id": "r1",
+                "call_id": "call-one", "name": "add_numbers",
+                "arguments": '{"first_number": 12, "second_number": 30}',
+            })
+            raw.events.put_nowait({
+                "type": "response.done", "response": {"id": "r1", "status": "completed"},
+            })
+            await sink.wait_for(lambda events: any(event.get_function_responses() for event in events))
+            raw.events.put_nowait({
+                "type": "response.output_audio_transcript.done", "transcript": "The sum is 42.",
+            })
+            raw.events.put_nowait({
+                "type": "response.done", "response": {"id": "r2", "status": "completed"},
+            })
+            await sink.wait_for(lambda events: any(event.turn_complete for event in events))
+            self.assertEqual([event["type"] for event in raw.sent], [
+                "conversation.item.create", "response.create",
+            ])
+            self.assertEqual(raw.sent[0]["item"]["call_id"], "call-one")
+            self.assertEqual(json.loads(raw.sent[0]["item"]["output"]), {"sum": 42})
+            self.assertEqual(sum(bool(event.turn_complete) for event in sink.events), 1)
+            self.assertTrue(any(event.get_function_calls() for event in sink.events))
+        finally:
+            requests.close()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await runner.close()
 
     async def test_same_application_runner_multiple_turns_and_audio(self):
         runner = await self.make_runner()
