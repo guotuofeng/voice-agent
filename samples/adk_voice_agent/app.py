@@ -1,4 +1,4 @@
-"""One ADK live application for Gemini Live and Azure Foundry Voice Agent."""
+"""One ADK live application for Gemini, Foundry Voice Agents, and direct Voice Live."""
 
 from __future__ import annotations
 

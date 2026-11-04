@@ -276,7 +276,15 @@ class AzureLiveConnection(BaseLlmConnection):
             raise RuntimeError("Azure session audio configuration is not ready")
         audio = self.input_resampler.convert(blob.data or b"")
         if audio:
-            await self.raw.input_audio_buffer.append(audio=audio)
+            await self.append_audio(audio)
+
+    async def append_audio(self, audio: bytes) -> None:
+        await self.raw.input_audio_buffer.append(audio=audio)
+
+    def audio_delta(self, event) -> bytes:
+        if not isinstance(event, models.RealtimeServerEventResponseAudioDelta):
+            raise AzureVoiceError("Expected SDK-decoded audio event")
+        return event.delta
 
     def translate(self, event) -> list[LlmResponse]:
         payload = self.payload(event)
@@ -305,11 +313,9 @@ class AzureLiveConnection(BaseLlmConnection):
         if response_id in self.interrupted_response_ids:
             return []
         if event_type in {"response.audio.delta", "response.output_audio.delta"}:
-            if not isinstance(event, models.RealtimeServerEventResponseAudioDelta):
-                raise AzureVoiceError("Expected SDK-decoded audio event")
             if self.output_resampler is None:
                 raise AzureVoiceError("Audio received before session configuration")
-            audio = self.output_resampler.convert(event.delta)
+            audio = self.output_resampler.convert(self.audio_delta(event))
             return [self.response(
                 partial=True,
                 content=types.Content(role="model", parts=[

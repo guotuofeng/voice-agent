@@ -1,22 +1,25 @@
-# Google ADK With an Existing Foundry Voice Agent
+# Google ADK With Foundry Voice Agents or Direct Voice Live
 
-Run the same ADK voice application against Gemini Live or an existing Azure
-Foundry Voice Agent by selecting a provider environment file. This is a sample
+Run the same ADK voice application against Gemini Live, an existing Azure
+Foundry Voice Agent, or the standalone Azure VoiceLive SDK by selecting a provider
+environment file. This is a sample
 ADK `BaseLlm`/`BaseLlmConnection` extension, not a built-in ADK provider or a
 Hosted Agent bridge.
 
 [app.py](app.py) uses one `Runner.run_live()`, `LiveRequestQueue`, `RunConfig`,
 microphone/playback implementation, and event sink. Provider selection lives in
 [providers.py](providers.py); Azure lifecycle and protocol conversion live in
-[azure_adk.py](azure_adk.py). The Azure path does not construct a Google API
-client, need a Gemini key/model, or call Google services.
+[azure_adk.py](azure_adk.py). Direct Voice Live configuration and SDK adaptation
+live in [voicelive_adk.py](voicelive_adk.py), which reuses the realtime event,
+resampling, interruption, and function-result handling. Neither Azure provider
+constructs a Google API client, needs a Gemini key/model, or calls Google services.
 
 ## Prerequisites
 
 - Python 3.12 and the packages in [requirements.txt](requirements.txt).
 - For microphone mode, working input/output audio devices. Linux may require
   a system PortAudio package for `sounddevice`.
-- For Azure, a Foundry project endpoint and an **existing voice agent** you can
+- For the saved-agent Azure provider, a Foundry project endpoint and an **existing voice agent** you can
   invoke using Microsoft Entra ID. Authenticate through a supported
   `DefaultAzureCredential` source, such as a signed-in Azure CLI locally or a
   managed identity when hosted. Keep credentials server-side.
@@ -28,8 +31,11 @@ client, need a Gemini key/model, or call Google services.
 - For Gemini, a Google API key with access to a Live audio model. Discover a
   model available to your account as described below; do not assume an old
   preview model is still available.
+- For direct Voice Live, an Azure resource endpoint, access to a supported model
+  and Azure standard voice in its region, and Microsoft Entra ID invocation
+  permissions. No Foundry project endpoint or saved agent is required.
 
-The adapter never creates or versions an Azure agent and never sends
+The saved-agent adapter never creates or versions an Azure agent and never sends
 `session.update`. Instructions, model, voice, VAD, and tool configuration remain
 owned by the saved resource. Do not copy Azure instructions or server-managed
 tools into the ADK `Agent`. Opt-in local functions have matching declarations
@@ -52,6 +58,8 @@ environment, such as `voiceagent`, are necessary. Tested SDK versions are
 `google-adk==2.12.0`, `google-genai==2.32.0`, and
 `azure-ai-projects[voice]==2.7.0`. The Azure integration uses the supported async
 Projects Voice SDK `project.beta.voice_agents.realtime.connect()` surface.
+Direct Voice Live uses `azure-ai-voicelive[aiohttp]==1.3.0b1` and
+`azure.ai.voicelive.aio.connect()`. These are distinct SDK paths, not aliases.
 
 ## Select a Provider
 
@@ -100,6 +108,9 @@ python app.py --env-file .env.azure
 python app.py --env-file .env.gemini
 ```
 
+For standalone Voice Live, see the next section; all application audio flags
+also work with that provider.
+
 Speak multiple turns, then speak over a long response to interrupt it. Use
 headphones to avoid acoustic feedback. Ctrl+C disconnects and cleans up; use
 `--seconds 60` for a bounded microphone session.
@@ -128,16 +139,86 @@ The saved agent controls its responses, including greetings. WAV mode assumes
 one input utterance per file; avoid files with several VAD-separated utterances
 or unrelated autonomous responses. Check the transcripts, not just turn counts.
 
+## Direct Azure Voice Live (No Saved Agent)
+
+This provider uses the standalone
+[`azure-ai-voicelive` SDK](https://github.com/Azure/azure-sdk-for-python/tree/main/sdk/voicelive/azure-ai-voicelive),
+not the Projects Voice SDK and not a hosted-agent bridge:
+
+```text
+ADK Runner.run_live()
+  -> AzureVoiceLive / VoiceLiveConnection
+  -> azure.ai.voicelive.aio.connect(endpoint, credential, model)
+  -> Voice Live model session
+```
+
+Copy [.env.voicelive.example](.env.voicelive.example) to `.env.voicelive`, which is
+git-ignored. Edit its values before running:
+
+```powershell
+Copy-Item .env.voicelive.example .env.voicelive
+python app.py --env-file .env.voicelive --seconds 60
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `VOICE_PROVIDER=voicelive` | Select the standalone SDK provider |
+| `AZURE_VOICELIVE_ENDPOINT` | HTTPS resource endpoint, e.g. `https://RESOURCE.services.ai.azure.com`, not a project endpoint |
+| `AZURE_VOICELIVE_MODEL` | A supported model ID, e.g. `gpt-realtime`; confirm regional access |
+| `AZURE_VOICELIVE_VOICE` | An Azure standard voice name supported by that model/region |
+| `AZURE_VOICELIVE_INSTRUCTIONS` | Optional base instructions; defaults to `You are a helpful voice assistant.` |
+
+Authentication uses server-side `DefaultAzureCredential`, as for the saved-agent
+provider. The adapter sends one initial `session.update` with model-session
+instructions, the Azure standard voice, mono PCM16 at 24 kHz, Azure Speech input
+transcription, and server VAD with automatic responses, interruption, and history
+auto-truncation. ADK string/text `Agent.instruction` content is appended to the
+base instructions. No agent resource is read, created, or versioned.
+
+The shared application still sends 16-kHz PCM16. The adapter resamples it to
+24 kHz, then base64-encodes it for the VoiceLive SDK's input buffer API. Typed SDK
+audio events contain decoded PCM bytes; the adapter maps them into the same
+24-kHz ADK audio blobs used by the other providers.
+
+To run local functions, no Azure agent setup or `--apply` is needed:
+
+```powershell
+python app.py --env-file .env.voicelive --enable-tools --seconds 60
+python app.py --env-file .env.voicelive --wav question.wav --no-playback --seconds 90
+```
+
+ADK's function declarations are registered in the initial session configuration,
+and ADK executes the functions locally. The provider accepts the JSON-schema
+declarations generated by the pinned ADK version, including `parameters_json_schema`,
+but rejects legacy `parameters` schemas, unmatched executors, and provider-specific
+built-in tools. The shared tool registry needs only a callable for direct Voice
+Live execution; its separate saved-agent declarations are used only by the
+Projects provider's setup helper.
+
+This is a live-audio provider, not general ADK feature parity. It shares the
+existing restrictions on history replay, session resumption, automatic reconnect,
+multimodal input, multi-agent transfers, and approval/long-running tool workflows.
+Configure the voice through the environment rather than `RunConfig.speech_config`.
+Only Azure standard voices are configured by this sample, not native OpenAI voice
+names. Saved-agent MCP/Toolbox configuration is not imported into direct sessions.
+Keep local functions short and read-only; barge-in cannot undo an operation.
+
+Direct Voice Live has offline SDK-model and real ADK Runner coverage, but has
+**not** been validated against a live Azure endpoint. The recorded saved-agent
+and Gemini results below do not validate this new provider. Run a live smoke test
+with your resource to verify audio, transcription, barge-in, tool execution, and
+spoken tool results before relying on it.
+
 ## Run a Local Function Tool
 
-Enable the same ADK `add_numbers(first_number, second_number)` function for either
+Enable the same ADK `add_numbers(first_number, second_number)` function for any
 provider. It runs locally, returns a JSON sum, and needs no external API or secret.
 Without `--enable-tools`, the existing no-client-tools behavior is unchanged.
 
 Shared tool implementations and registration live in
 [tool_support.py](tool_support.py). To add a function, define its callable there
 and add its callable/description/JSON-schema pair to `FUNCTION_TOOLS`. The app
-uses `get_tools()` for either provider, and Azure setup uses the same registry
+uses `get_tools()` for every provider, and Azure setup uses the same registry
 to build saved function declarations. No per-tool edits to the app, provider
 selection, or protocol adapter are needed. ADK derives its schema from the
 callable, so keep its signature and the registered JSON schema compatible.
@@ -295,11 +376,19 @@ Conda environment when finished if it is no longer needed.
 
 ## Verification
 
-Run offline checks without either provider's credentials:
+Run offline checks without any provider's credentials:
 
 ```powershell
-python -m unittest discover -s . -p test_adapter.py -v
+python -m unittest discover -s . -p "test_*.py" -v
 ```
+
+The direct Voice Live checks in [test_voicelive.py](test_voicelive.py) use typed
+VoiceLive SDK events with a mocked transport. They cover connection/session
+configuration, instructions, tool registration, PCM/base64 conversion, real ADK
+Runner audio and function execution, multi-turn transcripts, interruption,
+configuration errors, authentication, disconnects, timeout, and cleanup.
+Network access and Google/Projects client construction are forbidden in these
+tests; no provider credentials are needed.
 
 Recorded on 2026-10-29, Windows, Python 3.12.16 in the isolated `adk` environment:
 

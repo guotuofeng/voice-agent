@@ -68,7 +68,20 @@ def create_model(*, session_id: str, user_id: str) -> BaseLlm:
         from google.adk.models.google_llm import Gemini
 
         return Gemini(model=required("GEMINI_MODEL"))
-    raise ValueError("VOICE_PROVIDER must be azure or gemini")
+    if provider == "voicelive":
+        from voicelive_adk import AzureVoiceLive
+
+        return AzureVoiceLive(
+            endpoint=required("AZURE_VOICELIVE_ENDPOINT"),
+            model=required("AZURE_VOICELIVE_MODEL"),
+            voice=required("AZURE_VOICELIVE_VOICE"),
+            instructions=os.environ.get(
+                "AZURE_VOICELIVE_INSTRUCTIONS", "You are a helpful voice assistant."
+            ),
+            adk_session_id=session_id,
+            adk_user_id=user_id,
+        )
+    raise ValueError("VOICE_PROVIDER must be azure, voicelive, or gemini")
 
 
 def list_gemini_models() -> None:

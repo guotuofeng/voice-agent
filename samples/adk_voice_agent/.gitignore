@@ -1,5 +1,6 @@
 .env
 .env.azure
 .env.gemini
+.env.voicelive
 artifacts/
 __pycache__/
